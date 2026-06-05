@@ -96,13 +96,15 @@ def main():
     SEED_G = (seed ^ 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
     SEED_B = (seed ^ 0xD1B54A32D192ED03) & 0xFFFFFFFFFFFFFFFF
 
-    r_lin = diamond_square(RNG(SEED_R), args.turbulence)[:H, :W]
-    g_lin = diamond_square(RNG(SEED_G), args.turbulence)[:H, :W]
-    b_lin = diamond_square(RNG(SEED_B), args.turbulence)[:H, :W]
+    # Truncate to f32 before sRGB encode — matches Rust's layer buffer storage
+    # so the GUI export and headless binary agree at max-delta 0.
+    r_lin = diamond_square(RNG(SEED_R), args.turbulence)[:H, :W].astype(np.float32)
+    g_lin = diamond_square(RNG(SEED_G), args.turbulence)[:H, :W].astype(np.float32)
+    b_lin = diamond_square(RNG(SEED_B), args.turbulence)[:H, :W].astype(np.float32)
 
-    r8 = (linear_to_srgb(r_lin) * 255.0 + 0.5).astype(np.uint8)
-    g8 = (linear_to_srgb(g_lin) * 255.0 + 0.5).astype(np.uint8)
-    b8 = (linear_to_srgb(b_lin) * 255.0 + 0.5).astype(np.uint8)
+    r8 = (linear_to_srgb(r_lin.astype(np.float64)) * 255.0 + 0.5).astype(np.uint8)
+    g8 = (linear_to_srgb(g_lin.astype(np.float64)) * 255.0 + 0.5).astype(np.uint8)
+    b8 = (linear_to_srgb(b_lin.astype(np.float64)) * 255.0 + 0.5).astype(np.uint8)
     a8 = np.full((H, W), 255, dtype=np.uint8)
 
     rgba = np.stack([r8, g8, b8, a8], axis=-1)
