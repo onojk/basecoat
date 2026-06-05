@@ -93,7 +93,8 @@ struct BasecoatApp {
     plasma_turbulence: f32,
 
     // zoom / pan
-    zoom: f32,
+    zoom: f32,       // 0.0 = fit-to-window; >0 = absolute scale
+    fit_zoom: f32,   // last computed fit scale, updated each canvas frame
     pan: egui::Vec2,
 
     // status line
@@ -114,7 +115,8 @@ impl BasecoatApp {
             plasma_seed: 0,
             plasma_seed_str: "0".into(),
             plasma_turbulence: 1.0,
-            zoom: 1.0,
+            zoom: 0.0,
+            fit_zoom: 1.0,
             pan: egui::Vec2::ZERO,
             status: "Ready".into(),
         }
@@ -179,6 +181,31 @@ impl eframe::App for BasecoatApp {
         self.ensure_composite(ctx);
 
         // ----------------------------------------------------------------
+        // Keyboard zoom  (Ctrl+=  Ctrl++  Ctrl+-  Ctrl+0)
+        // ----------------------------------------------------------------
+        const ZOOM_STEP: f32 = 1.25;
+        let (zoom_in, zoom_out, zoom_fit) = ctx.input(|i| {
+            let ctrl = i.modifiers.ctrl;
+            (
+                ctrl && (i.key_pressed(egui::Key::Equals) || i.key_pressed(egui::Key::Plus)),
+                ctrl && i.key_pressed(egui::Key::Minus),
+                ctrl && i.key_pressed(egui::Key::Num0),
+            )
+        });
+        if zoom_in {
+            let cur = if self.zoom == 0.0 { self.fit_zoom } else { self.zoom };
+            self.zoom = (cur * ZOOM_STEP).clamp(0.05, 10.0);
+        }
+        if zoom_out {
+            let cur = if self.zoom == 0.0 { self.fit_zoom } else { self.zoom };
+            self.zoom = (cur / ZOOM_STEP).clamp(0.05, 10.0);
+        }
+        if zoom_fit {
+            self.zoom = 0.0;
+            self.pan  = egui::Vec2::ZERO;
+        }
+
+        // ----------------------------------------------------------------
         // Menu bar
         // ----------------------------------------------------------------
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
@@ -230,18 +257,19 @@ impl eframe::App for BasecoatApp {
 
                 // View menu
                 ui.menu_button("View", |ui| {
-                    if ui.button("Fit").clicked() {
-                        self.zoom = 0.0; // 0 = fit
-                        self.pan  = egui::Vec2::ZERO;
+                    if ui.button("Zoom In   Ctrl+=").clicked() {
+                        let cur = if self.zoom == 0.0 { self.fit_zoom } else { self.zoom };
+                        self.zoom = (cur * ZOOM_STEP).clamp(0.05, 10.0);
                         ui.close_menu();
                     }
-                    if ui.button("100%").clicked() {
-                        self.zoom = 1.0;
-                        self.pan  = egui::Vec2::ZERO;
+                    if ui.button("Zoom Out  Ctrl+\u{2212}").clicked() {
+                        let cur = if self.zoom == 0.0 { self.fit_zoom } else { self.zoom };
+                        self.zoom = (cur / ZOOM_STEP).clamp(0.05, 10.0);
                         ui.close_menu();
                     }
-                    if ui.button("Reset pan").clicked() {
-                        self.pan = egui::Vec2::ZERO;
+                    if ui.button("Fit       Ctrl+0").clicked() {
+                        self.zoom = 0.0;
+                        self.pan  = egui::Vec2::ZERO;
                         ui.close_menu();
                     }
                 });
@@ -281,17 +309,11 @@ impl BasecoatApp {
         let avail = ui.available_size();
         let img_size = egui::vec2(W as f32, H as f32);
 
-        // Compute effective zoom (0 = fit)
+        // Compute effective zoom (0 = fit); store fit_zoom for keyboard shortcuts.
         let fit_zoom = (avail.x / img_size.x).min(avail.y / img_size.y);
+        self.fit_zoom = fit_zoom;
         let effective_zoom = if self.zoom == 0.0 { fit_zoom } else { self.zoom };
         let display_size = img_size * effective_zoom;
-
-        // Scroll zoom on the canvas
-        let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
-        if scroll_delta != 0.0 && ui.rect_contains_pointer(ui.max_rect()) {
-            let factor = if scroll_delta > 0.0 { 1.1f32 } else { 1.0 / 1.1 };
-            self.zoom = (effective_zoom * factor).clamp(0.05, 10.0);
-        }
 
         // Pan with drag
         let drag = ui.input(|i| {
