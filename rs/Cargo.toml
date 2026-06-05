@@ -1,0 +1,12 @@
+[package]
+name = "basecoat"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "canvas"
+path = "src/main.rs"
+
+[dependencies]
+image = "0.25"
+png = "0.17"

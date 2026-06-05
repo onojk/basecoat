@@ -1,0 +1,13 @@
+## Python
+py/.venv/
+py/__pycache__/
+*.pyc
+*.pyo
+
+## Rust
+rs/target/
+
+## Generated images (tracked per-technique branch if desired, not by default)
+*.png
+*.jpg
+*.jpeg
