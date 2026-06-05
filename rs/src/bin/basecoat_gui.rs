@@ -1,6 +1,7 @@
 //! basecoat GUI — thin viewer/driver over the headless engine.
 //! egui/eframe + wgpu backend.
 
+use basecoat::bands::{generate_bands, growth_to_thickness};
 use basecoat::layers::*;
 use basecoat::plasma::{apply_plasma, H as IMG_H, W as IMG_W};
 use basecoat::punch::punch;
@@ -98,6 +99,10 @@ struct BasecoatApp {
     punch_saturation: f32,
     punch_passes:     u32,
 
+    // band generator controls
+    band_growth: f32,   // 0..100
+    band_fill:   f32,   // 0..100
+
     // zoom / pan
     zoom: f32,       // 0.0 = fit-to-window; >0 = absolute scale
     fit_zoom: f32,   // last computed fit scale, updated each canvas frame
@@ -124,6 +129,8 @@ impl BasecoatApp {
             punch_contrast:   9.0,
             punch_saturation: 4.0,
             punch_passes:     6,
+            band_growth: 30.0,
+            band_fill:   90.0,
             zoom: 0.0,
             fit_zoom: 1.0,
             pan: egui::Vec2::ZERO,
@@ -355,6 +362,99 @@ impl BasecoatApp {
             });
     }
 
+    fn run_band_generate(&mut self) {
+        if self.stack.layers.is_empty() { return; }
+
+        let seed_idx = self.active;
+        let growth   = self.band_growth;
+        let fill     = self.band_fill;
+
+        // Build seed mask from active layer's opaque pixels
+        let seed_layer = &self.stack.layers[seed_idx];
+        let pw = seed_layer.width  as usize;
+        let ph = seed_layer.height as usize;
+        let seed_mask: Vec<bool> = seed_layer.rgba
+            .chunks_exact(4)
+            .map(|c| c[3] > 0.5)
+            .collect();
+
+        let thickness = growth_to_thickness(growth);
+        let bands     = generate_bands(&seed_mask, pw, ph, thickness, fill);
+        if bands.is_empty() {
+            self.status = "Band Generate: seed has no opaque pixels".into();
+            return;
+        }
+
+        // ONE structural snapshot — the entire run is a single undo step.
+        self.stack.checkpoint();
+
+        // Insert bands, innermost first (each inserted at seed_idx pushes seed up).
+        // Generator-owned count tracks how many band layers we hold.
+        let mut gen_count: usize = 0;
+
+        for band in &bands {
+            // 12-cap: merge outermost (bottom-most) 6 generator layers before adding 13th
+            if gen_count == 12 {
+                let merge_base = seed_idx; // bottom-most gen layer
+                // Merge layers[merge_base .. merge_base+6] into one
+                let merged_rgba = {
+                    let total_px = pw * ph;
+                    let mut rgba = vec![0.0f32; total_px * 4];
+                    for li in merge_base..merge_base + 6 {
+                        let l = &self.stack.layers[li];
+                        for px in 0..total_px {
+                            let b = px * 4;
+                            if l.rgba[b + 3] > 0.5 {
+                                rgba[b    ] = l.rgba[b    ];
+                                rgba[b + 1] = l.rgba[b + 1];
+                                rgba[b + 2] = l.rgba[b + 2];
+                                rgba[b + 3] = l.rgba[b + 3];
+                            }
+                        }
+                    }
+                    rgba
+                };
+                let mut merged = Layer::new(pw as u32, ph as u32, [0.0; 4]);
+                merged.rgba = merged_rgba;
+                merged.name = "[band]merged".into();
+                self.stack.layers[merge_base] = merged;
+                // Remove the 5 now-redundant layers above merge_base
+                for _ in 0..5 {
+                    self.stack.layers.remove(merge_base + 1);
+                }
+                // Seed shifted down 5; active tracks seed
+                self.active -= 5;
+                gen_count    = 7; // 12 - 6 + 1
+            }
+
+            // Build band layer (transparent canvas + opaque pixels for this ring)
+            let mut layer = Layer::new(pw as u32, ph as u32, [0.0; 4]);
+            let (r, g, b) = if band.white { (1.0f32, 1.0, 1.0) } else { (0.0, 0.0, 0.0) };
+            for (px, &in_band) in band.mask.iter().enumerate() {
+                if in_band {
+                    let base = px * 4;
+                    layer.rgba[base    ] = r;
+                    layer.rgba[base + 1] = g;
+                    layer.rgba[base + 2] = b;
+                    layer.rgba[base + 3] = 1.0;
+                }
+            }
+            layer.mode    = BlendMode::Normal;
+            layer.opacity = 1.0;
+            layer.name    = format!("[band]{}", gen_count + 1);
+
+            // Insert at seed_idx — seed (self.active) shifts up by 1
+            self.stack.layers.insert(seed_idx, layer);
+            self.active  += 1;
+            gen_count    += 1;
+        }
+
+        self.dirty  = true;
+        self.status = format!(
+            "Generated {gen_count} band layers (growth={growth:.0}% fill={fill:.0}%)"
+        );
+    }
+
     fn show_layers_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("Layers");
         ui.separator();
@@ -564,6 +664,27 @@ impl BasecoatApp {
             self.dirty  = true;
             let name    = self.active_name();
             self.status = format!("Punch applied to {name} (k={k:.1} sat={sat:.1} ×{pass})");
+        }
+
+        // ---- Band Generator ----
+        ui.separator();
+        ui.heading("Band Generator");
+
+        ui.horizontal(|ui| {
+            ui.label("Growth %:");
+            let t = growth_to_thickness(self.band_growth);
+            ui.add(egui::Slider::new(&mut self.band_growth, 0.0..=100.0)
+                .fixed_decimals(0))
+                .on_hover_text(format!("thickness = {t} px"));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Fill %:");
+            ui.add(egui::Slider::new(&mut self.band_fill, 0.0..=100.0)
+                .fixed_decimals(0));
+        });
+
+        if ui.button("Generate").clicked() {
+            self.run_band_generate();
         }
 
         if self.stack.layers.len() >= MAX_LAYERS {

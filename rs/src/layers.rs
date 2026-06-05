@@ -187,6 +187,12 @@ impl Stack {
         self.push_pixel_snap(idx);
     }
 
+    /// Take a full structural snapshot (whole layer list). Use once before a
+    /// multi-step operation so the entire run is undone in a single Undo.
+    pub fn checkpoint(&mut self) {
+        self.push_struct_snap();
+    }
+
     fn push_pixel_snap(&mut self, idx: usize) {
         let buf = self.layers[idx].rgba.clone();
         self.undo.push(Snap::Pixel { idx, buf });
