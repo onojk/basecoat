@@ -2,6 +2,7 @@
 //! egui/eframe + wgpu backend.
 
 use basecoat::bands::{generate_bands, growth_to_thickness};
+use basecoat::edge::{aggr_to_n, edge};
 use basecoat::layers::*;
 use basecoat::plasma::{apply_plasma, H as IMG_H, W as IMG_W};
 use basecoat::punch::punch;
@@ -103,6 +104,10 @@ struct BasecoatApp {
     band_growth: f32,   // 0..100
     band_fill:   f32,   // 0..100
 
+    // edge controls
+    edge_aggr:  f32,    // 0..100
+    edge_width: usize,  // 1..7
+
     // zoom / pan
     zoom: f32,       // 0.0 = fit-to-window; >0 = absolute scale
     fit_zoom: f32,   // last computed fit scale, updated each canvas frame
@@ -131,6 +136,8 @@ impl BasecoatApp {
             punch_passes:     6,
             band_growth: 30.0,
             band_fill:   90.0,
+            edge_aggr:  50.0,
+            edge_width: 3,
             zoom: 0.0,
             fit_zoom: 1.0,
             pan: egui::Vec2::ZERO,
@@ -664,6 +671,52 @@ impl BasecoatApp {
             self.dirty  = true;
             let name    = self.active_name();
             self.status = format!("Punch applied to {name} (k={k:.1} sat={sat:.1} ×{pass})");
+        }
+
+        // ---- Edge ----
+        ui.separator();
+        ui.heading("Edge");
+
+        ui.horizontal(|ui| {
+            ui.label("Aggr %:");
+            let n = aggr_to_n(self.edge_aggr);
+            ui.add(egui::Slider::new(&mut self.edge_aggr, 0.0..=100.0)
+                .fixed_decimals(0))
+                .on_hover_text(format!("N={n} levels"));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Width px:");
+            let mut w = self.edge_width as i32;
+            if ui.add(egui::Slider::new(&mut w, 1..=7)).changed() {
+                self.edge_width = w as usize;
+            }
+        });
+
+        if ui.button("Apply Edge").clicked() {
+            let aggr  = self.edge_aggr;
+            let width = self.edge_width;
+            let idx   = self.active;
+            if !self.stack.layers.is_empty() {
+                // One undo snapshot for the whole op
+                self.stack.checkpoint();
+
+                let src = &self.stack.layers[idx];
+                let pw  = src.width  as usize;
+                let ph  = src.height as usize;
+                let edge_buf = edge(&src.rgba.clone(), pw, ph, aggr, width);
+
+                let mut edge_layer = Layer::new(pw as u32, ph as u32, [0.0; 4]);
+                edge_layer.rgba = edge_buf;
+                edge_layer.name = "edge".into();
+
+                // Insert ABOVE active layer
+                self.stack.layers.insert(idx + 1, edge_layer);
+                self.active = idx + 1;
+                self.dirty  = true;
+
+                let n = aggr_to_n(aggr);
+                self.status = format!("Edge layer created (N={n} w={width})");
+            }
         }
 
         // ---- Band Generator ----
