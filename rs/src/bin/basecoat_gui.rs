@@ -3,6 +3,7 @@
 
 use basecoat::layers::*;
 use basecoat::plasma::{apply_plasma, H as IMG_H, W as IMG_W};
+use basecoat::punch::punch;
 use eframe::egui;
 use png::{BitDepth, ColorType, Encoder, Unit};
 use std::io::BufWriter;
@@ -92,6 +93,11 @@ struct BasecoatApp {
     plasma_seed_str: String,
     plasma_turbulence: f32,
 
+    // punch controls
+    punch_contrast:   f32,
+    punch_saturation: f32,
+    punch_passes:     u32,
+
     // zoom / pan
     zoom: f32,       // 0.0 = fit-to-window; >0 = absolute scale
     fit_zoom: f32,   // last computed fit scale, updated each canvas frame
@@ -115,6 +121,9 @@ impl BasecoatApp {
             plasma_seed: 0,
             plasma_seed_str: "0".into(),
             plasma_turbulence: 1.0,
+            punch_contrast:   9.0,
+            punch_saturation: 4.0,
+            punch_passes:     6,
             zoom: 0.0,
             fit_zoom: 1.0,
             pan: egui::Vec2::ZERO,
@@ -523,6 +532,39 @@ impl BasecoatApp {
                 self.status = format!("Plasma applied to {name} (seed={seed})");
             }
         });
+
+        // ---- Punch technique ----
+        ui.separator();
+        ui.heading("Punch");
+
+        ui.horizontal(|ui| {
+            ui.label("Contrast:");
+            ui.add(egui::Slider::new(&mut self.punch_contrast, 0.0..=9.0).fixed_decimals(1));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Saturation:");
+            ui.add(egui::Slider::new(&mut self.punch_saturation, 0.0..=4.0).fixed_decimals(1));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Passes:");
+            let mut p = self.punch_passes as i32;
+            if ui.add(egui::Slider::new(&mut p, 1..=6)).changed() {
+                self.punch_passes = p as u32;
+            }
+        });
+
+        if ui.button("Apply Punch").clicked() {
+            let k    = self.punch_contrast;
+            let sat  = self.punch_saturation;
+            let pass = self.punch_passes;
+            let idx  = self.active;
+            // Pixel-op snapshot: save buffer before mutation, then punch in-place.
+            self.stack.snapshot_layer(idx);
+            punch(&mut self.stack.layers[idx].rgba, k, sat, pass);
+            self.dirty  = true;
+            let name    = self.active_name();
+            self.status = format!("Punch applied to {name} (k={k:.1} sat={sat:.1} ×{pass})");
+        }
 
         if self.stack.layers.len() >= MAX_LAYERS {
             ui.colored_label(egui::Color32::YELLOW, format!("Layer cap: {MAX_LAYERS}"));

@@ -181,6 +181,12 @@ impl Stack {
         Self { layers: Vec::new(), undo: Vec::new() }
     }
 
+    /// Snapshot one layer's pixel buffer for undo without modifying it.
+    /// Use before any destructive pixel op (punch, custom fill, etc.).
+    pub fn snapshot_layer(&mut self, idx: usize) {
+        self.push_pixel_snap(idx);
+    }
+
     fn push_pixel_snap(&mut self, idx: usize) {
         let buf = self.layers[idx].rgba.clone();
         self.undo.push(Snap::Pixel { idx, buf });
