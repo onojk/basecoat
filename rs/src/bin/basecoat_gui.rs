@@ -608,58 +608,62 @@ impl BasecoatApp {
 
     fn run_kaleido(&mut self) {
         if self.stack.layers.is_empty() { return; }
-        if self.stack.layers.len() >= MAX_LAYERS {
-            self.status = format!("Layer cap ({MAX_LAYERS}) reached — cannot kaleidoscope");
-            return;
-        }
 
         let segs = self.kaleido_segments as u32;
         let rot  = self.kaleido_rotation as f64;
         let zoom = self.kaleido_zoom     as f64;
 
-        // Collect marked layers (ascending = bottom-first in composite order)
+        // Collect marked indices (ascending = bottom-first in stack order).
         let mut sorted: Vec<usize> = self.marked.iter().copied().collect();
         sorted.sort_unstable();
 
-        let from_active = sorted.is_empty();
-
-        let (source_layer, insert_above, n_sources) = if from_active {
-            let src     = self.stack.layers[self.active].clone();
-            let above   = self.active;
-            (src, above, 1usize)
+        // Build (display_name, source_layer) pairs — one per marked layer.
+        // Force visible=true so a marked-but-hidden layer still gets kaleidoscoped.
+        let sources: Vec<(String, Layer)> = if sorted.is_empty() {
+            let i = self.active;
+            let l = &self.stack.layers[i];
+            let name = if l.name.is_empty() { format!("Layer {i}") } else { l.name.clone() };
+            let mut src = l.clone();
+            src.visible = true;
+            vec![(name, src)]
         } else {
-            // Force visible=true on every cloned layer so that all N marks
-            // genuinely contribute pixels — composite() skips invisible layers,
-            // so without this an invisible mark would be counted in n_sources
-            // but silently dropped from the source, hiding one layer's content.
-            let layers: Vec<Layer> = sorted.iter()
-                .map(|&i| {
-                    let mut l = self.stack.layers[i].clone();
-                    l.visible = true;
-                    l
-                })
-                .collect();
-            let composited = composite(&layers);
-            let topmost    = *sorted.last().unwrap();
-            (composited, topmost, sorted.len())
+            sorted.iter().map(|&i| {
+                let l = &self.stack.layers[i];
+                let name = if l.name.is_empty() { format!("Layer {i}") } else { l.name.clone() };
+                let mut src = l.clone();
+                src.visible = true;
+                (name, src)
+            }).collect()
         };
 
-        let mut out = kaleido(&source_layer, segs, rot, zoom);
-        out.name = format!("kaleido s={segs} r={rot:.0} z={zoom:.2}");
+        let n = sources.len();
+        if self.stack.layers.len() + n > MAX_LAYERS {
+            self.status = format!(
+                "Layer cap ({MAX_LAYERS}) — need {n} slot{} for kaleido",
+                if n == 1 { "" } else { "s" }
+            );
+            return;
+        }
 
-        let insert_at = insert_above + 1;
+        // One undo snapshot for all N outputs; undo removes them all at once.
         self.stack.checkpoint();
-        self.stack.layers.insert(insert_at, out);
-        self.thumb_insert(insert_at);
-        self.active = insert_at;
+
+        // Append each kaleido output above the current stack top, in source
+        // order (bottom source → lowest new output, top source → topmost).
+        for (src_name, src_layer) in &sources {
+            let mut out = kaleido(src_layer, segs, rot, zoom);
+            out.name = format!("kaleido: {src_name}");
+            self.stack.layers.push(out);
+            self.thumb_textures.push(None);
+            self.thumb_dirty.push(true);
+        }
+
+        self.active = self.stack.layers.len() - 1;
         self.dirty  = true;
         self.marked.clear();
 
-        self.status = if from_active {
-            format!("Kaleidoscope (active layer, seg={segs})")
-        } else {
-            format!("Kaleidoscope ({n_sources} marks composited, seg={segs})")
-        };
+        let plural = if n == 1 { "layer" } else { "layers" };
+        self.status = format!("Kaleidoscope: {n} {plural} (seg={segs})");
     }
 
     // ---- Layers panel -----------------------------------------------------
@@ -1086,7 +1090,7 @@ impl BasecoatApp {
         });
         let at_cap = self.stack.layers.len() >= MAX_LAYERS;
         if ui.add_enabled(!at_cap, egui::Button::new("Apply Kaleidoscope"))
-            .on_hover_text("Composite marked layers (or active) → kaleidoscope → new layer above")
+            .on_hover_text("Kaleidoscope each marked layer independently → one new output per source appended above stack")
             .clicked()
         {
             self.run_kaleido();
