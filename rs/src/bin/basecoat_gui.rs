@@ -633,26 +633,34 @@ impl BasecoatApp {
                     self.status = "Layer deleted".into();
                 }
             }
-            if ui.button("↑").on_hover_text("Move up").clicked() {
-                let n = self.stack.layers.len();
-                if self.active + 1 < n {
-                    self.stack.reorder(self.active, self.active + 1);
-                    self.thumb_textures.swap(self.active, self.active + 1);
-                    self.thumb_dirty.swap(self.active, self.active + 1);
-                    self.active += 1;
-                    self.dirty   = true;
-                    self.marked.clear();
-                }
+            let n           = self.stack.layers.len();
+            let can_move_up = self.active + 1 < n;
+            let can_move_dn = self.active > 0;
+            if ui.add_enabled(can_move_up, egui::Button::new("↑"))
+                .on_hover_text("Move layer up (toward top of composite)")
+                .clicked()
+            {
+                self.stack.checkpoint();
+                self.stack.reorder(self.active, self.active + 1);
+                self.thumb_textures.swap(self.active, self.active + 1);
+                self.thumb_dirty.swap(self.active, self.active + 1);
+                self.active += 1;
+                self.dirty   = true;
+                self.marked.clear();
+                self.status  = "Moved layer up".into();
             }
-            if ui.button("↓").on_hover_text("Move down").clicked() {
-                if self.active > 0 {
-                    self.stack.reorder(self.active, self.active - 1);
-                    self.thumb_textures.swap(self.active, self.active - 1);
-                    self.thumb_dirty.swap(self.active, self.active - 1);
-                    self.active -= 1;
-                    self.dirty   = true;
-                    self.marked.clear();
-                }
+            if ui.add_enabled(can_move_dn, egui::Button::new("↓"))
+                .on_hover_text("Move layer down (toward bottom of composite)")
+                .clicked()
+            {
+                self.stack.checkpoint();
+                self.stack.reorder(self.active, self.active - 1);
+                self.thumb_textures.swap(self.active, self.active - 1);
+                self.thumb_dirty.swap(self.active, self.active - 1);
+                self.active -= 1;
+                self.dirty   = true;
+                self.marked.clear();
+                self.status  = "Moved layer down".into();
             }
             if ui.button("Flatten").on_hover_text("Flatten visible").clicked() {
                 self.stack.flatten_visible();
