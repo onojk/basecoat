@@ -74,7 +74,9 @@ fn layer_to_color_image(layer: &Layer) -> egui::ColorImage {
 // Thumbnail: box-average downsample + checkerboard composite
 // ---------------------------------------------------------------------------
 
-fn make_thumbnail(layer: &Layer, slot: usize, ctx: &egui::Context) -> egui::TextureHandle {
+/// Generate the thumbnail pixel data without touching any egui texture state.
+/// The caller is responsible for uploading via ctx.load_texture or tex.set().
+fn make_thumb_image(layer: &Layer) -> egui::ColorImage {
     let lw = layer.width  as usize;
     let lh = layer.height as usize;
     let mut pixels = Vec::with_capacity(THUMB_SIZE * THUMB_SIZE);
@@ -124,11 +126,7 @@ fn make_thumbnail(layer: &Layer, slot: usize, ctx: &egui::Context) -> egui::Text
         }
     }
 
-    ctx.load_texture(
-        format!("layer_thumb_{slot}"),
-        egui::ColorImage { size: [THUMB_SIZE, THUMB_SIZE], pixels },
-        egui::TextureOptions::LINEAR,
-    )
+    egui::ColorImage { size: [THUMB_SIZE, THUMB_SIZE], pixels }
 }
 
 // ---------------------------------------------------------------------------
@@ -241,18 +239,25 @@ impl BasecoatApp {
     }
 
     /// Mark one slot dirty (pixel content changed, but layer still exists).
+    ///
+    /// The existing TextureHandle is kept alive intentionally: dropping it
+    /// mid-frame while a shape still references its TextureId causes a wgpu
+    /// "texture destroyed" validation panic. The handle's content will be
+    /// updated in-place via set() at the start of the next frame.
     fn thumb_invalidate(&mut self, i: usize) {
         if i < self.thumb_dirty.len() {
-            self.thumb_textures[i] = None;
-            self.thumb_dirty[i]    = true;
+            self.thumb_dirty[i] = true;
+            // Do NOT touch thumb_textures[i] — keep the handle alive.
         }
     }
 
-    /// Mark every slot dirty (used after undo / flatten when any layer may have changed).
+    /// Mark every slot dirty (undo / flatten / new canvas).
+    ///
+    /// Handles are preserved for the same reason as thumb_invalidate().
     fn thumb_invalidate_all(&mut self) {
         self.sync_thumb_cache();
-        for t in &mut self.thumb_textures { *t = None; }
-        for d in &mut self.thumb_dirty    { *d = true; }
+        for d in &mut self.thumb_dirty { *d = true; }
+        // Handles are not dropped here; set() will update them next frame.
     }
 
     /// Insert a new dirty slot at position `i`.
@@ -270,15 +275,34 @@ impl BasecoatApp {
     }
 
     /// Regenerate the first dirty thumbnail (at most one per frame).
-    /// Calls ctx.request_repaint() if more remain, so they stream in.
+    ///
+    /// If a handle already exists for the slot, its contents are updated
+    /// in-place via `TextureHandle::set()` so the TextureId never changes.
+    /// This avoids the wgpu "texture destroyed" panic that occurs when a
+    /// handle is dropped and recreated within the same frame: egui shapes
+    /// capturing the old TextureId would reference a freed GPU texture.
+    ///
+    /// Calls ctx.request_repaint() when more dirty slots remain.
     fn ensure_thumbnails(&mut self, ctx: &egui::Context) {
         self.sync_thumb_cache();
         for i in 0..self.stack.layers.len() {
             if self.thumb_dirty[i] {
-                let tex = make_thumbnail(&self.stack.layers[i], i, ctx);
-                self.thumb_textures[i] = Some(tex);
-                self.thumb_dirty[i]    = false;
-                // If more are pending, request another frame
+                let img = make_thumb_image(&self.stack.layers[i]);
+                match &mut self.thumb_textures[i] {
+                    Some(tex) => {
+                        // Update existing texture in-place — TextureId stays stable.
+                        tex.set(img, egui::TextureOptions::LINEAR);
+                    }
+                    slot @ None => {
+                        // First creation: allocate a new handle.
+                        *slot = Some(ctx.load_texture(
+                            format!("layer_thumb_{i}"),
+                            img,
+                            egui::TextureOptions::LINEAR,
+                        ));
+                    }
+                }
+                self.thumb_dirty[i] = false;
                 if self.thumb_dirty.iter().any(|&d| d) {
                     ctx.request_repaint();
                 }
