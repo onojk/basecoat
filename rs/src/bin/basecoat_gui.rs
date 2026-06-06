@@ -596,15 +596,26 @@ impl BasecoatApp {
         // ---- Layer ops row ----
         ui.horizontal(|ui| {
             let at_cap = self.stack.layers.len() >= MAX_LAYERS;
-            if ui.add_enabled(!at_cap, egui::Button::new("＋")).clicked() {
-                let layer = Layer::new(W, H, [0.0, 0.0, 0.0, 0.0]);
-                self.stack.add(layer).unwrap();
-                self.thumb_textures.push(None);
-                self.thumb_dirty.push(true);
-                self.active = self.stack.layers.len() - 1;
-                self.dirty  = true;
-                self.marked.clear();
-                self.status = "Layer added".into();
+            if ui.add_enabled(!at_cap, egui::Button::new("＋ New"))
+                .on_hover_text("New transparent layer (0,0,0,0) inserted above active")
+                .clicked()
+            {
+                if at_cap {
+                    self.status = format!("Layer cap ({MAX_LAYERS}) reached — cannot add");
+                } else {
+                    let insert_at  = self.active + 1;
+                    let layer_name = format!("Layer {}", self.stack.layers.len());
+                    let mut layer  = Layer::new(W, H, [0.0, 0.0, 0.0, 0.0]);
+                    layer.name     = layer_name.clone();
+                    // Structural snapshot so the whole insert is one Undo step.
+                    self.stack.checkpoint();
+                    self.stack.layers.insert(insert_at, layer);
+                    self.thumb_insert(insert_at);
+                    self.active = insert_at;
+                    self.dirty  = true;
+                    self.marked.clear();
+                    self.status = format!("Added transparent layer \"{layer_name}\"");
+                }
             }
             if ui.button("－").on_hover_text("Delete active").clicked() {
                 if !self.stack.layers.is_empty() {
