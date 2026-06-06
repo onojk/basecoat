@@ -617,6 +617,38 @@ impl BasecoatApp {
                     self.status = format!("Added transparent layer \"{layer_name}\"");
                 }
             }
+            if ui.add_enabled(!at_cap, egui::Button::new("Dup"))
+                .on_hover_text("Deep-copy active layer; insert above it, make it active")
+                .clicked()
+            {
+                if at_cap {
+                    self.status = format!("Layer cap ({MAX_LAYERS}) reached — cannot duplicate");
+                } else {
+                    let (dup_layer, copy_name) = {
+                        let src  = &self.stack.layers[self.active];
+                        let name = if src.name.is_empty() {
+                            format!("Layer {} copy", self.active)
+                        } else {
+                            format!("{} copy", src.name)
+                        };
+                        let mut d  = Layer::new(src.width, src.height, [0.0; 4]);
+                        d.rgba     = src.rgba.clone();
+                        d.mode     = src.mode;
+                        d.opacity  = src.opacity;
+                        d.visible  = src.visible;
+                        d.name     = name.clone();
+                        (d, name)
+                    };
+                    let insert_at = self.active + 1;
+                    self.stack.checkpoint();
+                    self.stack.layers.insert(insert_at, dup_layer);
+                    self.thumb_insert(insert_at);
+                    self.active = insert_at;
+                    self.dirty  = true;
+                    self.marked.clear();
+                    self.status = format!("Duplicated \"{copy_name}\"");
+                }
+            }
             if ui.button("Del").on_hover_text("Delete active layer").clicked() {
                 if !self.stack.layers.is_empty() {
                     self.stack.remove(self.active);
@@ -672,13 +704,54 @@ impl BasecoatApp {
             }
         });
 
-        // Mark All / Clear Marks
+        // Mark All / Clear Marks / Merge
         ui.horizontal(|ui| {
             if ui.small_button("Mark All").clicked() {
                 self.marked = (0..self.stack.layers.len()).collect();
             }
             if ui.small_button("Clear Marks").clicked() {
                 self.marked.clear();
+            }
+            let can_merge = self.marked.len() >= 2;
+            if ui.add_enabled(can_merge, egui::Button::new("Merge"))
+                .on_hover_text("Composite marked layers (in stack order) into one 'merged' layer")
+                .clicked()
+            {
+                // Sort ascending = bottom-first in composite order.
+                // Non-contiguous marks are pulled together: composited in stack order,
+                // result inserted at topmost-marked's adjusted position, scattered
+                // marked layers removed; unmarked layers keep their relative order.
+                let mut sorted: Vec<usize> = self.marked.iter().copied().collect();
+                sorted.sort_unstable();
+
+                let layers_to_merge: Vec<Layer> = sorted.iter()
+                    .map(|&i| self.stack.layers[i].clone())
+                    .collect();
+                let mut merged = composite(&layers_to_merge);
+                merged.mode    = BlendMode::Normal;
+                merged.opacity = 1.0;
+                merged.visible = true;
+                merged.name    = "merged".into();
+
+                // After removing all `sorted.len()` marked layers in descending order,
+                // the topmost's original index shifts left by (sorted.len()-1) because
+                // that many lower-indexed removals precede it.
+                let topmost   = *sorted.last().unwrap();
+                let insert_at = topmost - (sorted.len() - 1);
+                let n_merged  = sorted.len();
+
+                self.stack.checkpoint();
+                for &idx in sorted.iter().rev() {
+                    self.stack.layers.remove(idx);
+                    self.thumb_remove(idx);
+                }
+                self.stack.layers.insert(insert_at, merged);
+                self.thumb_insert(insert_at);
+
+                self.active = insert_at;
+                self.dirty  = true;
+                self.marked.clear();
+                self.status = format!("Merged {n_merged} layers");
             }
             let n = self.marked.len();
             if n > 0 {
