@@ -628,8 +628,16 @@ impl BasecoatApp {
             let above   = self.active;
             (src, above, 1usize)
         } else {
+            // Force visible=true on every cloned layer so that all N marks
+            // genuinely contribute pixels — composite() skips invisible layers,
+            // so without this an invisible mark would be counted in n_sources
+            // but silently dropped from the source, hiding one layer's content.
             let layers: Vec<Layer> = sorted.iter()
-                .map(|&i| self.stack.layers[i].clone())
+                .map(|&i| {
+                    let mut l = self.stack.layers[i].clone();
+                    l.visible = true;
+                    l
+                })
                 .collect();
             let composited = composite(&layers);
             let topmost    = *sorted.last().unwrap();
