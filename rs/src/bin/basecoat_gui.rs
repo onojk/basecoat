@@ -614,27 +614,30 @@ impl BasecoatApp {
         let zoom = self.kaleido_zoom     as f64;
 
         // Collect marked indices (ascending = bottom-first in stack order).
+        // self.marked stores STACK INDICES (same coordinate system as self.stack.layers[i]).
         let mut sorted: Vec<usize> = self.marked.iter().copied().collect();
         sorted.sort_unstable();
 
-        // Build (display_name, source_layer) pairs — one per marked layer.
+        eprintln!("[kaleido] marks={:?} active={} stack_len={}",
+                  sorted, self.active, self.stack.layers.len());
+
+        // When no layers are marked, kaleido does nothing and shows a hint.
+        // (Previously fell back to active layer — removed to prevent silent mis-targeting.)
+        if sorted.is_empty() {
+            self.status = "Kaleidoscope: no layers marked — check a layer checkbox first".into();
+            return;
+        }
+
+        // Build (stack_idx, display_name, source_layer) triples — one per marked layer.
         // Force visible=true so a marked-but-hidden layer still gets kaleidoscoped.
-        let sources: Vec<(String, Layer)> = if sorted.is_empty() {
-            let i = self.active;
+        let sources: Vec<(usize, String, Layer)> = sorted.iter().map(|&i| {
             let l = &self.stack.layers[i];
             let name = if l.name.is_empty() { format!("Layer {i}") } else { l.name.clone() };
             let mut src = l.clone();
             src.visible = true;
-            vec![(name, src)]
-        } else {
-            sorted.iter().map(|&i| {
-                let l = &self.stack.layers[i];
-                let name = if l.name.is_empty() { format!("Layer {i}") } else { l.name.clone() };
-                let mut src = l.clone();
-                src.visible = true;
-                (name, src)
-            }).collect()
-        };
+            eprintln!("[kaleido]   source stack[{i}] = \"{name}\"");
+            (i, name, src)
+        }).collect();
 
         let n = sources.len();
         if self.stack.layers.len() + n > MAX_LAYERS {
@@ -650,9 +653,10 @@ impl BasecoatApp {
 
         // Append each kaleido output above the current stack top, in source
         // order (bottom source → lowest new output, top source → topmost).
-        for (src_name, src_layer) in &sources {
+        for (src_idx, src_name, src_layer) in &sources {
             let mut out = kaleido(src_layer, segs, rot, zoom);
-            out.name = format!("kaleido: {src_name}");
+            // Embed source stack index in the name so it's unambiguous in the panel.
+            out.name = format!("kaleido[{src_idx}]: {src_name}");
             self.stack.layers.push(out);
             self.thumb_textures.push(None);
             self.thumb_dirty.push(true);
@@ -662,8 +666,13 @@ impl BasecoatApp {
         self.dirty  = true;
         self.marked.clear();
 
+        // Status: list source names so user can see which layers were processed.
+        let src_list: Vec<String> = sources.iter()
+            .map(|(i, name, _)| format!("[{i}]{name}"))
+            .collect();
         let plural = if n == 1 { "layer" } else { "layers" };
-        self.status = format!("Kaleidoscope: {n} {plural} (seg={segs})");
+        self.status = format!("Kaleidoscope: {n} {plural} (seg={segs}) — sources: {}",
+                              src_list.join(", "));
     }
 
     // ---- Layers panel -----------------------------------------------------
@@ -797,11 +806,14 @@ impl BasecoatApp {
                 .clicked()
             {
                 // Sort ascending = bottom-first in composite order.
+                // self.marked stores STACK INDICES (same coordinate system as self.stack.layers[i]).
                 // Non-contiguous marks are pulled together: composited in stack order,
                 // result inserted at topmost-marked's adjusted position, scattered
                 // marked layers removed; unmarked layers keep their relative order.
                 let mut sorted: Vec<usize> = self.marked.iter().copied().collect();
                 sorted.sort_unstable();
+
+                eprintln!("[merge] marks={:?} stack_len={}", sorted, self.stack.layers.len());
 
                 let layers_to_merge: Vec<Layer> = sorted.iter()
                     .map(|&i| self.stack.layers[i].clone())
@@ -922,10 +934,17 @@ impl BasecoatApp {
                             (new_marked, eye_clicked, label_clicked, new_opacity)
                         });
 
-                    // Apply interactions (after the closure so no borrow conflicts)
+                    // Apply interactions (after the closure so no borrow conflicts).
+                    // display_i == stack index (loop iterates n-1..=0, same as stack index).
                     if resp.inner.0 != is_marked {
-                        if resp.inner.0 { self.marked.insert(display_i); }
-                        else            { self.marked.remove(&display_i); }
+                        if resp.inner.0 {
+                            eprintln!("[mark] checked stack[{display_i}]  marks={:?}",
+                                      { let mut m = self.marked.clone(); m.insert(display_i); m });
+                            self.marked.insert(display_i);
+                        } else {
+                            eprintln!("[mark] unchecked stack[{display_i}]");
+                            self.marked.remove(&display_i);
+                        }
                     }
                     if resp.inner.1 {
                         self.stack.layers[display_i].visible ^= true;
