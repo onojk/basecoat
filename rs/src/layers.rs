@@ -95,7 +95,12 @@ impl Layer {
 // ---------------------------------------------------------------------------
 
 pub fn composite(layers: &[Layer]) -> Layer {
-    let first = layers.first().expect("empty layer list");
+    let first = match layers.first() {
+        Some(l) => l,
+        // Empty slice: return 1×1 transparent rather than panic.
+        // Callers should guard against compositing an empty list.
+        None => return Layer::new(1, 1, [0.0; 4]),
+    };
     let (w, h) = (first.width, first.height);
     let n = (w * h) as usize;
 

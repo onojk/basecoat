@@ -323,7 +323,7 @@ impl BasecoatApp {
     // ---- Misc helpers -----------------------------------------------------
 
     fn ensure_composite(&mut self, ctx: &egui::Context) {
-        if !self.dirty { return; }
+        if !self.dirty || self.stack.layers.is_empty() { return; }
         let comp = self.stack.composite();
         let img  = layer_to_color_image(&comp);
         self.texture = Some(ctx.load_texture("canvas", img, egui::TextureOptions::LINEAR));
@@ -427,6 +427,14 @@ impl eframe::App for BasecoatApp {
                 ui.menu_button("Edit", |ui| {
                     if ui.button("Undo").clicked() {
                         if self.stack.undo() {
+                            // Undo can restore the pre-first-layer empty state.
+                            // Re-add a blank canvas so the stack is never empty.
+                            if self.stack.layers.is_empty() {
+                                self.stack.layers.push(Layer::new(W, H, [0.0; 4]));
+                                self.thumb_textures = vec![None];
+                                self.thumb_dirty    = vec![true];
+                                self.active         = 0;
+                            }
                             self.clamp_active();
                             self.dirty = true;
                             self.thumb_invalidate_all();
