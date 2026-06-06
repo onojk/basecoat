@@ -636,8 +636,8 @@ impl BasecoatApp {
             let n           = self.stack.layers.len();
             let can_move_up = self.active + 1 < n;
             let can_move_dn = self.active > 0;
-            if ui.add_enabled(can_move_up, egui::Button::new("↑"))
-                .on_hover_text("Move layer up (toward top of composite)")
+            if ui.add_enabled(can_move_up, egui::Button::new("▲"))
+                .on_hover_text("Move layer up (toward top)")
                 .clicked()
             {
                 self.stack.checkpoint();
@@ -649,8 +649,8 @@ impl BasecoatApp {
                 self.marked.clear();
                 self.status  = "Moved layer up".into();
             }
-            if ui.add_enabled(can_move_dn, egui::Button::new("↓"))
-                .on_hover_text("Move layer down (toward bottom of composite)")
+            if ui.add_enabled(can_move_dn, egui::Button::new("▼"))
+                .on_hover_text("Move layer down (toward bottom)")
                 .clicked()
             {
                 self.stack.checkpoint();
