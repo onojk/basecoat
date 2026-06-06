@@ -127,4 +127,53 @@ fn main() {
         top.mode = BlendMode::Overlay;
         write_png(&composite(&[bot, top]), "test_3500.png");
     }
+
+    test_per_layer_opacity();
+    println!("All layer tests passed.");
+}
+
+fn test_per_layer_opacity() {
+    use basecoat::layers::{composite, BlendMode, Layer};
+
+    fn solid(r: f32, g: f32, b: f32, a: f32, opacity: f32) -> Layer {
+        let rgba = (0..4).map(|i| [r, g, b, a][i]).cycle().take(4).collect();
+        Layer { rgba, width: 1, height: 1, mode: BlendMode::Normal,
+                opacity, visible: true, name: String::new() }
+    }
+
+    // Layer 0 (bottom): solid red, full opacity
+    // Layer 1 (top): solid blue, opacity = 0.0 — should not contribute at all
+    let red  = solid(1.0, 0.0, 0.0, 1.0, 1.0);
+    let blue = solid(0.0, 0.0, 1.0, 1.0, 0.0);
+    let result = composite(&[red, blue]);
+    let r = result.rgba[0]; let g = result.rgba[1]; let b = result.rgba[2];
+    assert!((r - 1.0).abs() < 0.01 && b < 0.01,
+        "blue at opacity=0 must not affect red below: got ({r},{g},{b})");
+    println!("PASS  opacity=0 top layer transparent");
+
+    // Layer 0 (bottom): solid red, full opacity
+    // Layer 1 (top): solid blue, opacity = 0.5 — should blend 50/50 over red
+    let red2  = solid(1.0, 0.0, 0.0, 1.0, 1.0);
+    let blue2 = solid(0.0, 0.0, 1.0, 1.0, 0.5);
+    let result2 = composite(&[red2, blue2]);
+    let r2 = result2.rgba[0]; let b2 = result2.rgba[2];
+    // Expected: blue at 0.5 over red: r_out = (0*0.5 + 1.0*1.0*0.5)/1 = 0.5; b_out = (1*0.5)/1 = 0.5
+    assert!((r2 - 0.5).abs() < 0.02 && (b2 - 0.5).abs() < 0.02,
+        "blue at opacity=0.5 should blend 50/50 over red: got r={r2} b={b2}");
+    println!("PASS  opacity=0.5 top layer blends correctly");
+
+    // Verify LOWER layer's opacity is also honored independently
+    // Layer 0 (bottom): solid red, opacity = 0.5 (semi-transparent over black bg)
+    // Layer 1 (top): nothing (transparent)
+    let red3  = solid(1.0, 0.0, 0.0, 1.0, 0.5);
+    let trans = solid(0.0, 0.0, 0.0, 0.0, 1.0);
+    let result3 = composite(&[red3, trans]);
+    let r3 = result3.rgba[0]; let a3 = result3.rgba[3];
+    assert!((r3 - 1.0).abs() < 0.02,
+        "lower layer at opacity=0.5 should have r=1.0 (straight-alpha): got r={r3}");
+    assert!((a3 - 0.5).abs() < 0.02,
+        "lower layer at opacity=0.5 should have output alpha=0.5: got a={a3}");
+    println!("PASS  opacity=0.5 LOWER layer honored independently (a={a3:.3})");
+
+    println!("PASS  test_per_layer_opacity");
 }

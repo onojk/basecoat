@@ -850,14 +850,14 @@ impl BasecoatApp {
                     let is_active = display_i == self.active;
 
                     // Pre-collect read-only state (avoids borrow conflicts in the Frame closure)
-                    let (label, visible, is_marked, thumb_id) = {
+                    let (label, visible, is_marked, thumb_id, opacity) = {
                         let l = &self.stack.layers[display_i];
                         let lbl = if l.name.is_empty() { format!("Layer {display_i}") } else { l.name.clone() };
                         let tid = self.thumb_textures
                             .get(display_i)
                             .and_then(|o| o.as_ref())
                             .map(|t| t.id());
-                        (lbl, l.visible, self.marked.contains(&display_i), tid)
+                        (lbl, l.visible, self.marked.contains(&display_i), tid, l.opacity)
                     };
 
                     // Active row highlight; marked rows get a secondary tint
@@ -873,9 +873,10 @@ impl BasecoatApp {
                         .fill(bg)
                         .inner_margin(egui::Margin::symmetric(4.0, 2.0))
                         .show(ui, |ui| {
-                            let mut new_marked  = is_marked;
+                            let mut new_marked    = is_marked;
                             let mut eye_clicked   = false;
                             let mut label_clicked = false;
+                            let mut new_opacity   = opacity;
 
                             ui.horizontal(|ui| {
                                 // Checkbox (mark)
@@ -904,13 +905,21 @@ impl BasecoatApp {
                                 let eye = if visible { "Vis" } else { "Hid" };
                                 if ui.small_button(eye).clicked() { eye_clicked = true; }
 
+                                // Per-row opacity — drag left/right, or double-click to type
+                                ui.add(
+                                    egui::DragValue::new(&mut new_opacity)
+                                        .range(0.0_f32..=1.0_f32)
+                                        .speed(0.005)
+                                        .fixed_decimals(2)
+                                ).on_hover_text("Opacity (drag or double-click to type)");
+
                                 // Layer name / select
                                 if ui.selectable_label(is_active, &label).clicked() {
                                     label_clicked = true;
                                 }
                             });
 
-                            (new_marked, eye_clicked, label_clicked)
+                            (new_marked, eye_clicked, label_clicked, new_opacity)
                         });
 
                     // Apply interactions (after the closure so no borrow conflicts)
@@ -924,6 +933,11 @@ impl BasecoatApp {
                     }
                     if resp.inner.2 {
                         self.active = display_i;
+                    }
+                    let new_op = resp.inner.3;
+                    if (new_op - opacity).abs() > 1e-4 {
+                        self.stack.layers[display_i].opacity = new_op;
+                        self.dirty = true;
                     }
                 }
             });
