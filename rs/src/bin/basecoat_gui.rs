@@ -596,7 +596,7 @@ impl BasecoatApp {
         // ---- Layer ops row ----
         ui.horizontal(|ui| {
             let at_cap = self.stack.layers.len() >= MAX_LAYERS;
-            if ui.add_enabled(!at_cap, egui::Button::new("＋ New"))
+            if ui.add_enabled(!at_cap, egui::Button::new("+ New"))
                 .on_hover_text("New transparent layer (0,0,0,0) inserted above active")
                 .clicked()
             {
@@ -617,7 +617,7 @@ impl BasecoatApp {
                     self.status = format!("Added transparent layer \"{layer_name}\"");
                 }
             }
-            if ui.button("－").on_hover_text("Delete active").clicked() {
+            if ui.button("Del").on_hover_text("Delete active layer").clicked() {
                 if !self.stack.layers.is_empty() {
                     self.stack.remove(self.active);
                     self.thumb_remove(self.active);
@@ -636,7 +636,7 @@ impl BasecoatApp {
             let n           = self.stack.layers.len();
             let can_move_up = self.active + 1 < n;
             let can_move_dn = self.active > 0;
-            if ui.add_enabled(can_move_up, egui::Button::new("↑"))
+            if ui.add_enabled(can_move_up, egui::Button::new("Up"))
                 .on_hover_text("Move layer up (toward top)")
                 .clicked()
             {
@@ -649,7 +649,7 @@ impl BasecoatApp {
                 self.marked.clear();
                 self.status  = "Moved layer up".into();
             }
-            if ui.add_enabled(can_move_dn, egui::Button::new("↓"))
+            if ui.add_enabled(can_move_dn, egui::Button::new("Dn"))
                 .on_hover_text("Move layer down (toward bottom)")
                 .clicked()
             {
@@ -749,7 +749,7 @@ impl BasecoatApp {
                                 }
 
                                 // Eye toggle
-                                let eye = if visible { "👁" } else { "⊘" };
+                                let eye = if visible { "Vis" } else { "Hid" };
                                 if ui.small_button(eye).clicked() { eye_clicked = true; }
 
                                 // Layer name / select
