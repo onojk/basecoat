@@ -3,6 +3,7 @@
 
 use basecoat::bands::{generate_bands, growth_to_thickness};
 use basecoat::edge::{aggr_to_n, edge};
+use basecoat::kaleido::kaleido;
 use basecoat::layers::*;
 use basecoat::plasma::{apply_plasma, H as IMG_H, W as IMG_W};
 use basecoat::punch::punch;
@@ -179,6 +180,10 @@ struct BasecoatApp {
     edge_aggr:  f32,
     edge_width: usize,
 
+    kaleido_segments: i32,
+    kaleido_rotation: f32,
+    kaleido_zoom:     f32,
+
     // Zoom / pan
     zoom:     f32,
     fit_zoom: f32,
@@ -216,6 +221,10 @@ impl BasecoatApp {
 
             edge_aggr:  50.0,
             edge_width: 3,
+
+            kaleido_segments: 6,
+            kaleido_rotation: 0.0,
+            kaleido_zoom:     1.0,
 
             zoom:     0.0,
             fit_zoom: 1.0,
@@ -585,6 +594,56 @@ impl BasecoatApp {
 
         self.dirty  = true;
         self.status = format!("Generated {gen_count} band layers (growth={growth:.0}% fill={fill:.0}%)");
+    }
+
+    // ---- Kaleidoscope apply -----------------------------------------------
+
+    fn run_kaleido(&mut self) {
+        if self.stack.layers.is_empty() { return; }
+        if self.stack.layers.len() >= MAX_LAYERS {
+            self.status = format!("Layer cap ({MAX_LAYERS}) reached — cannot kaleidoscope");
+            return;
+        }
+
+        let segs = self.kaleido_segments as u32;
+        let rot  = self.kaleido_rotation as f64;
+        let zoom = self.kaleido_zoom     as f64;
+
+        // Collect marked layers (ascending = bottom-first in composite order)
+        let mut sorted: Vec<usize> = self.marked.iter().copied().collect();
+        sorted.sort_unstable();
+
+        let from_active = sorted.is_empty();
+
+        let (source_layer, insert_above, n_sources) = if from_active {
+            let src     = self.stack.layers[self.active].clone();
+            let above   = self.active;
+            (src, above, 1usize)
+        } else {
+            let layers: Vec<Layer> = sorted.iter()
+                .map(|&i| self.stack.layers[i].clone())
+                .collect();
+            let composited = composite(&layers);
+            let topmost    = *sorted.last().unwrap();
+            (composited, topmost, sorted.len())
+        };
+
+        let mut out = kaleido(&source_layer, segs, rot, zoom);
+        out.name = format!("kaleido s={segs} r={rot:.0} z={zoom:.2}");
+
+        let insert_at = insert_above + 1;
+        self.stack.checkpoint();
+        self.stack.layers.insert(insert_at, out);
+        self.thumb_insert(insert_at);
+        self.active = insert_at;
+        self.dirty  = true;
+        self.marked.clear();
+
+        self.status = if from_active {
+            format!("Kaleidoscope (active layer, seg={segs})")
+        } else {
+            format!("Kaleidoscope ({n_sources} marks composited, seg={segs})")
+        };
     }
 
     // ---- Layers panel -----------------------------------------------------
@@ -991,7 +1050,33 @@ impl BasecoatApp {
             self.run_band_generate();
         }
 
-        if self.stack.layers.len() >= MAX_LAYERS {
+        // ---- Kaleidoscope ----
+        ui.separator();
+        ui.heading("Kaleidoscope");
+        ui.horizontal(|ui| {
+            ui.label("Segments:");
+            let mut s = self.kaleido_segments;
+            if ui.add(egui::Slider::new(&mut s, 2..=24)).changed() {
+                self.kaleido_segments = s;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Rotation:");
+            ui.add(egui::Slider::new(&mut self.kaleido_rotation, 0.0..=360.0).fixed_decimals(0));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Zoom:");
+            ui.add(egui::Slider::new(&mut self.kaleido_zoom, 0.25..=4.0).fixed_decimals(2));
+        });
+        let at_cap = self.stack.layers.len() >= MAX_LAYERS;
+        if ui.add_enabled(!at_cap, egui::Button::new("Apply Kaleidoscope"))
+            .on_hover_text("Composite marked layers (or active) → kaleidoscope → new layer above")
+            .clicked()
+        {
+            self.run_kaleido();
+        }
+
+        if at_cap {
             ui.colored_label(egui::Color32::YELLOW, format!("Layer cap: {MAX_LAYERS}"));
         }
     }
