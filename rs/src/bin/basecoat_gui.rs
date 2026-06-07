@@ -5,14 +5,18 @@ use basecoat::bands::{generate_bands, growth_to_thickness};
 use basecoat::edge::{aggr_to_n, edge};
 use basecoat::kaleido::kaleido;
 use basecoat::layers::*;
-use basecoat::plasma::{apply_plasma, H as IMG_H, W as IMG_W};
-use basecoat::qbist::{create_info, optimize, render as qbist_render};
+use basecoat::plasma::{apply_plasma_with_progress, H as IMG_H, W as IMG_W};
+use basecoat::qbist::{create_info, optimize, render_with_progress as qbist_render_threaded};
 use basecoat::quad::quad as quad_fn;
 use basecoat::punch::punch;
 use eframe::egui;
 use png::{BitDepth, ColorType, Encoder, Unit};
 use std::collections::HashSet;
 use std::io::BufWriter;
+use std::sync::{
+    atomic::{AtomicU32, Ordering},
+    mpsc, Arc,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const W: u32 = IMG_W as u32;
@@ -21,6 +25,15 @@ const PPM: u32 = 23622;
 
 const THUMB_SIZE: usize = 64;  // texture resolution
 const THUMB_PX:   f32   = 40.0; // display size in the layer row
+
+// Payload type for the background render channel.
+// Plasma sends linear-light f32 directly; qbist sends sRGB u8 for conversion.
+enum RenderBuf {
+    /// Already linear-light — copy straight into layer.rgba.
+    Linear(Vec<f32>),
+    /// sRGB u8 — apply srgb_to_linear before writing into layer.rgba.
+    SrgbU8(Vec<u8>),
+}
 
 // ---------------------------------------------------------------------------
 // Export helper (same encode path as headless binaries)
@@ -176,6 +189,14 @@ struct BasecoatApp {
     qbist_seed_str:     String,
     qbist_oversampling: u8,
 
+    // Background render state — None when idle.
+    render_rx:       Option<mpsc::Receiver<RenderBuf>>,
+    render_progress: Arc<AtomicU32>,
+    render_total_rows: usize,
+    render_target_idx: usize,
+    render_finish:   String,
+    render_label:    String,
+
     punch_contrast:   f32,
     punch_saturation: f32,
     punch_passes:     u32,
@@ -223,6 +244,13 @@ impl BasecoatApp {
             qbist_seed:         0,
             qbist_seed_str:     "0".into(),
             qbist_oversampling: 4,
+
+            render_rx:         None,
+            render_progress:   Arc::new(AtomicU32::new(0)),
+            render_total_rows: 0,
+            render_target_idx: 0,
+            render_finish:     String::new(),
+            render_label:      String::new(),
 
             punch_contrast:   9.0,
             punch_saturation: 4.0,
@@ -385,6 +413,49 @@ fn mode_label(m: BlendMode) -> &'static str {
 
 impl eframe::App for BasecoatApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // ---- Poll background render (plasma / qbist) ------------------------
+        // try_recv() borrow ends when `poll` is assigned (owned Result), so self is free after.
+        let poll = self.render_rx.as_ref().map(|rx| rx.try_recv());
+        match poll {
+            Some(Ok(buf)) => {
+                self.render_rx = None;
+                let idx    = self.render_target_idx;
+                let status = std::mem::take(&mut self.render_finish);
+                if idx < self.stack.layers.len() {
+                    match buf {
+                        RenderBuf::SrgbU8(pixels) => {
+                            let w     = self.stack.layers[idx].width  as usize;
+                            let h     = self.stack.layers[idx].height as usize;
+                            let layer = &mut self.stack.layers[idx];
+                            for i in 0..w * h {
+                                let s = i * 4;
+                                layer.rgba[s    ] = srgb_to_linear(pixels[s    ] as f32 / 255.0);
+                                layer.rgba[s + 1] = srgb_to_linear(pixels[s + 1] as f32 / 255.0);
+                                layer.rgba[s + 2] = srgb_to_linear(pixels[s + 2] as f32 / 255.0);
+                                layer.rgba[s + 3] = 1.0;
+                            }
+                        }
+                        RenderBuf::Linear(pixels) => {
+                            self.stack.layers[idx].rgba = pixels;
+                        }
+                    }
+                    self.dirty = true;
+                    self.thumb_invalidate(idx);
+                    self.status = status;
+                } else {
+                    self.status = format!(
+                        "{} render finished but target layer was deleted — result discarded",
+                        self.render_label
+                    );
+                }
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.render_rx = None;
+                self.status = format!("{} render thread disconnected unexpectedly", self.render_label);
+            }
+            Some(Err(mpsc::TryRecvError::Empty)) | None => {}
+        }
+
         self.ensure_composite(ctx);
         self.ensure_thumbnails(ctx);
 
@@ -501,6 +572,11 @@ impl eframe::App for BasecoatApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             self.show_canvas(ui);
         });
+
+        // Keep painting while any background render is in flight so the progress bar animates.
+        if self.render_rx.is_some() {
+            ctx.request_repaint();
+        }
     }
 }
 
@@ -1066,20 +1142,39 @@ impl BasecoatApp {
                 self.plasma_seed     = time_seed();
                 self.plasma_seed_str = self.plasma_seed.to_string();
             }
-            if ui.button("Apply").clicked() {
+            let in_flight = self.render_rx.is_some();
+            if ui.add_enabled(!in_flight, egui::Button::new("Apply")).clicked() {
                 let seed = self.plasma_seed;
                 let turb = self.plasma_turbulence as f64;
                 let idx  = self.active;
-                self.stack.snapshot_layer(idx);
-                let mut buf = vec![0.0f32; (W * H * 4) as usize];
-                apply_plasma(&mut buf, seed, turb);
-                self.stack.layers[idx].rgba = buf;
-                self.dirty = true;
-                self.thumb_invalidate(idx);
                 let name = self.active_name();
-                self.status = format!("Plasma on {name} (seed={seed})");
+                self.stack.checkpoint();
+                let progress = Arc::new(AtomicU32::new(0));
+                self.render_progress   = Arc::clone(&progress);
+                self.render_total_rows = IMG_H;
+                self.render_target_idx = idx;
+                self.render_finish     = format!("Plasma on {name} (seed={seed})");
+                self.render_label      = "Plasma".into();
+                let (tx, rx) = mpsc::channel();
+                self.render_rx = Some(rx);
+                std::thread::spawn(move || {
+                    let mut buf = vec![0.0f32; IMG_W * IMG_H * 4];
+                    apply_plasma_with_progress(&mut buf, seed, turb, &progress);
+                    let _ = tx.send(RenderBuf::Linear(buf));
+                });
             }
         });
+        if self.render_rx.is_some() && self.render_label == "Plasma" {
+            let done  = self.render_progress.load(Ordering::Relaxed) as f32;
+            let total = self.render_total_rows as f32;
+            let frac  = if total > 0.0 { (done / total).min(1.0) } else { 0.0 };
+            let pct   = (frac * 100.0) as u32;
+            ui.add(
+                egui::ProgressBar::new(frac)
+                    .text(format!("Rendering plasma… {pct}%"))
+                    .animate(true),
+            );
+        }
 
         // ---- Qbist ----
         ui.separator();
@@ -1116,33 +1211,44 @@ impl BasecoatApp {
                 self.qbist_seed     = time_seed();
                 self.qbist_seed_str = self.qbist_seed.to_string();
             }
-            if ui.button("Apply").clicked() {
+            let in_flight = self.render_rx.is_some();
+            if ui.add_enabled(!in_flight, egui::Button::new("Apply")).clicked() {
                 let seed = self.qbist_seed;
                 let os   = self.qbist_oversampling as usize;
                 let idx  = self.active;
                 let w    = self.stack.layers[idx].width  as usize;
                 let h    = self.stack.layers[idx].height as usize;
-                // Structural undo checkpoint — single Undo reverts the whole fill.
-                self.stack.checkpoint();
+                let name = self.active_name();
                 let mut genome = create_info(seed);
                 let (used_trans, used_reg) = optimize(&mut genome);
-                // qbist renders sRGB u8 directly (no gamma on the way out).
-                // Layer buffer is linear-light f32 — convert before writing.
-                let pixels = qbist_render(&genome, &used_trans, &used_reg, w, h, os);
-                let layer  = &mut self.stack.layers[idx];
-                for i in 0..w * h {
-                    let s = i * 4;
-                    layer.rgba[s    ] = srgb_to_linear(pixels[s    ] as f32 / 255.0);
-                    layer.rgba[s + 1] = srgb_to_linear(pixels[s + 1] as f32 / 255.0);
-                    layer.rgba[s + 2] = srgb_to_linear(pixels[s + 2] as f32 / 255.0);
-                    layer.rgba[s + 3] = 1.0;
-                }
-                self.dirty = true;
-                self.thumb_invalidate(idx);
-                let name = self.active_name();
-                self.status = format!("Qbist on {name} (seed={seed} os={os})");
+                self.stack.checkpoint();
+                let progress = Arc::new(AtomicU32::new(0));
+                self.render_progress   = Arc::clone(&progress);
+                self.render_total_rows = h;
+                self.render_target_idx = idx;
+                self.render_finish     = format!("Qbist on {name} (seed={seed} os={os})");
+                self.render_label      = "Qbist".into();
+                let (tx, rx) = mpsc::channel();
+                self.render_rx = Some(rx);
+                std::thread::spawn(move || {
+                    let buf = qbist_render_threaded(
+                        &genome, &used_trans, &used_reg, w, h, os, &progress,
+                    );
+                    let _ = tx.send(RenderBuf::SrgbU8(buf));
+                });
             }
         });
+        if self.render_rx.is_some() && self.render_label == "Qbist" {
+            let done  = self.render_progress.load(Ordering::Relaxed) as f32;
+            let total = self.render_total_rows as f32;
+            let frac  = if total > 0.0 { (done / total).min(1.0) } else { 0.0 };
+            let pct   = (frac * 100.0) as u32;
+            ui.add(
+                egui::ProgressBar::new(frac)
+                    .text(format!("Rendering qbist… {pct}%"))
+                    .animate(true),
+            );
+        }
 
         // ---- Punch ----
         ui.separator();

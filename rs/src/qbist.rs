@@ -1,6 +1,8 @@
 //! QBist genetic abstract-pattern fill — see spec/qbist.md.
 //! All register arithmetic in f64. No sRGB conversion (reg[0] bytes written directly).
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 pub const TRANSFORMS: usize = 36;
 pub const REGISTERS:  usize = 6;
 pub const OPCODES:    usize = 9;
@@ -162,17 +164,20 @@ fn apply(opcode: u8, sv: [f64; 3], cv: [f64; 3]) -> [f64; 3] {
 // Renderer
 // ---------------------------------------------------------------------------
 
-/// Render qbist to RGBA u8 bytes (row-major, w*h*4).
-/// No sRGB conversion — reg[0] values written directly per spec.
-pub fn render(
+/// Render qbist to RGBA u8 bytes (row-major, w*h*4), reporting progress.
+///
+/// `progress` is incremented to the completed row count after each row finishes
+/// (range 0..=h). Callers can read it with `Ordering::Relaxed` for display.
+/// Math is identical to `render`; the delta-0 contract still holds.
+pub fn render_with_progress(
     g:          &Genome,
     used_trans: &[bool; TRANSFORMS],
     used_reg:   &[bool; REGISTERS],
     w:          usize,
     h:          usize,
     os:         usize,
+    progress:   &AtomicU32,
 ) -> Vec<u8> {
-    // Collect active lists
     let reg_list:   Vec<usize> = (0..REGISTERS).filter(|&r| used_reg[r]).collect();
     let trans_list: Vec<usize> = (0..TRANSFORMS).filter(|&t| used_trans[t]).collect();
 
@@ -215,7 +220,24 @@ pub fn render(
             }
             // out[base+3] = 255 already (vec initialised to 255)
         }
+        // Report row completion — ~once per row, not per pixel.
+        progress.store(row as u32 + 1, Ordering::Relaxed);
     }
 
     out
+}
+
+/// Render qbist to RGBA u8 bytes (row-major, w*h*4).
+/// No sRGB conversion — reg[0] values written directly per spec.
+/// Delegates to `render_with_progress` with a throwaway atomic.
+pub fn render(
+    g:          &Genome,
+    used_trans: &[bool; TRANSFORMS],
+    used_reg:   &[bool; REGISTERS],
+    w:          usize,
+    h:          usize,
+    os:         usize,
+) -> Vec<u8> {
+    let dummy = AtomicU32::new(0);
+    render_with_progress(g, used_trans, used_reg, w, h, os, &dummy)
 }

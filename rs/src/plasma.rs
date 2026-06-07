@@ -1,6 +1,8 @@
 //! Diamond-square plasma generator — see spec/plasma.md.
 //! Shared between the headless binary and the GUI.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 pub const GRID: usize = 4097; // 2^12 + 1
 pub const W: usize = 3500;
 pub const H: usize = 3500;
@@ -98,9 +100,15 @@ fn diamond_square(rng: &mut Rng, turbulence: f64) -> Vec<f64> {
 
 // --- Public entry point ---------------------------------------------------
 
-/// Fill `layer_buf` (f32 linear-light RGBA, row-major, W×H×4) with plasma.
-/// seed and turbulence match spec/plasma.md.
-pub fn apply_plasma(layer_buf: &mut [f32], seed: u64, turbulence: f64) {
+/// Fill `layer_buf` (f32 linear-light RGBA, row-major, W×H×4) with plasma,
+/// reporting progress via `progress` (stores completed row count, 0..=H).
+/// Math is identical to `apply_plasma`; the delta-0 contract still holds.
+pub fn apply_plasma_with_progress(
+    layer_buf:  &mut [f32],
+    seed:       u64,
+    turbulence: f64,
+    progress:   &AtomicU32,
+) {
     let seed_r = seed;
     let seed_g = seed ^ 0x9E3779B97F4A7C15u64;
     let seed_b = seed ^ 0xD1B54A32D192ED03u64;
@@ -116,7 +124,17 @@ pub fn apply_plasma(layer_buf: &mut [f32], seed: u64, turbulence: f64) {
             layer_buf[dst    ] = r_grid[src] as f32;
             layer_buf[dst + 1] = g_grid[src] as f32;
             layer_buf[dst + 2] = b_grid[src] as f32;
-            layer_buf[dst + 3] = 1.0; // opaque
+            layer_buf[dst + 3] = 1.0;
         }
+        // Report row completion ~once per row, not per pixel.
+        progress.store(row as u32 + 1, Ordering::Relaxed);
     }
+}
+
+/// Fill `layer_buf` (f32 linear-light RGBA, row-major, W×H×4) with plasma.
+/// seed and turbulence match spec/plasma.md.
+/// Delegates to `apply_plasma_with_progress` with a throwaway atomic.
+pub fn apply_plasma(layer_buf: &mut [f32], seed: u64, turbulence: f64) {
+    let dummy = AtomicU32::new(0);
+    apply_plasma_with_progress(layer_buf, seed, turbulence, &dummy);
 }
