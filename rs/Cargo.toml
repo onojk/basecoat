@@ -7,6 +7,14 @@ edition = "2021"
 name = "canvas"
 path = "src/main.rs"
 
+[[bin]]
+name = "qbist"
+path = "src/bin/qbist.rs"
+
+[[bin]]
+name = "test_qbist"
+path = "src/bin/test_qbist.rs"
+
 [dependencies]
 image = "0.25"
 png   = "0.17"
