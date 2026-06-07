@@ -181,6 +181,10 @@ pub struct Stack {
     undo: Vec<Snap>,
 }
 
+impl Default for Stack {
+    fn default() -> Self { Self::new() }
+}
+
 impl Stack {
     pub fn new() -> Self {
         Self { layers: Vec::new(), undo: Vec::new() }

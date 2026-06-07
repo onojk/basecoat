@@ -42,7 +42,7 @@ pub fn generate_bands(
             break; // stop condition 2: canvas saturated
         }
 
-        let is_white = bands.len() % 2 == 0; // white first
+        let is_white = bands.len().is_multiple_of(2); // white first
         bands.push(Band { mask: new_ring.clone(), white: is_white });
 
         for (c, n) in coverage.iter_mut().zip(new_ring.iter()) {

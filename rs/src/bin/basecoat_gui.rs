@@ -737,21 +737,21 @@ impl BasecoatApp {
                     self.status = format!("Duplicated \"{copy_name}\"");
                 }
             }
-            if ui.button("Del").on_hover_text("Delete active layer").clicked() {
-                if !self.stack.layers.is_empty() {
-                    self.stack.remove(self.active);
-                    self.thumb_remove(self.active);
-                    if self.stack.layers.is_empty() {
-                        let layer = Layer::new(W, H, [0.0, 0.0, 0.0, 0.0]);
-                        self.stack.add(layer).unwrap();
-                        self.thumb_textures.push(None);
-                        self.thumb_dirty.push(true);
-                    }
-                    self.clamp_active();
-                    self.dirty  = true;
-                    self.marked.clear();
-                    self.status = "Layer deleted".into();
+            if ui.button("Del").on_hover_text("Delete active layer").clicked()
+                && !self.stack.layers.is_empty()
+            {
+                self.stack.remove(self.active);
+                self.thumb_remove(self.active);
+                if self.stack.layers.is_empty() {
+                    let layer = Layer::new(W, H, [0.0, 0.0, 0.0, 0.0]);
+                    self.stack.add(layer).unwrap();
+                    self.thumb_textures.push(None);
+                    self.thumb_dirty.push(true);
                 }
+                self.clamp_active();
+                self.dirty  = true;
+                self.marked.clear();
+                self.status = "Layer deleted".into();
             }
             let n           = self.stack.layers.len();
             let can_move_up = self.active + 1 < n;

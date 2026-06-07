@@ -4,7 +4,7 @@
 
 use basecoat::layers::*;
 use basecoat::plasma::{apply_plasma, H as IMG_H, W as IMG_W};
-use png::{BitDepth, ColorType, Encoder, Unit};
+use png::{BitDepth, ColorType, Encoder};
 use std::io::BufWriter;
 
 const W: u32 = IMG_W as u32;

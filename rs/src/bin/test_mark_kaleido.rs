@@ -127,9 +127,9 @@ fn test_merge_marks_non_top() {
     let green = solid(0.0, 1.0, 0.0);
     let blue  = solid(0.0, 0.0, 1.0);
 
-    let marks = vec![0usize, 1];
+    let marks = [0usize, 1];
     let layers_to_merge: Vec<Layer> = marks.iter()
-        .map(|&i| vec![red.clone(), green.clone(), blue.clone()][i].clone())
+        .map(|&i| [red.clone(), green.clone(), blue.clone()][i].clone())
         .collect();
     let merged = composite(&layers_to_merge);
 
@@ -141,8 +141,8 @@ fn test_merge_marks_non_top() {
 
 fn test_merge_skips_unmarked_top() {
     // Mark bottom and middle but NOT top.  Merged result should have no blue.
-    let layers = vec![solid(1.0, 0.0, 0.0), solid(0.0, 1.0, 0.0), solid(0.0, 0.0, 1.0)];
-    let marks = vec![0usize, 1]; // not 2
+    let layers = [solid(1.0, 0.0, 0.0), solid(0.0, 1.0, 0.0), solid(0.0, 0.0, 1.0)];
+    let marks = [0usize, 1]; // not 2
     let layers_to_merge: Vec<Layer> = marks.iter()
         .map(|&i| layers[i].clone())
         .collect();
