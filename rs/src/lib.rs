@@ -5,4 +5,5 @@ pub mod layers;
 pub mod plasma;
 pub mod punch;
 pub mod qbist;
+pub mod quad;
 pub mod sample;

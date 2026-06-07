@@ -7,6 +7,7 @@ use basecoat::kaleido::kaleido;
 use basecoat::layers::*;
 use basecoat::plasma::{apply_plasma, H as IMG_H, W as IMG_W};
 use basecoat::qbist::{create_info, optimize, render as qbist_render};
+use basecoat::quad::quad as quad_fn;
 use basecoat::punch::punch;
 use eframe::egui;
 use png::{BitDepth, ColorType, Encoder, Unit};
@@ -185,6 +186,8 @@ struct BasecoatApp {
     edge_aggr:  f32,
     edge_width: usize,
 
+    quad_tiles: u32,
+
     kaleido_segments: i32,
     kaleido_rotation: f32,
     kaleido_zoom:     f32,
@@ -230,6 +233,8 @@ impl BasecoatApp {
 
             edge_aggr:  50.0,
             edge_width: 3,
+
+            quad_tiles: 2,
 
             kaleido_segments: 6,
             kaleido_rotation: 0.0,
@@ -856,6 +861,48 @@ impl BasecoatApp {
             let n = self.marked.len();
             if n > 0 {
                 ui.label(format!("{n} marked"));
+            }
+        });
+
+        // ---- Quad mirror-tile row ----
+        ui.horizontal(|ui| {
+            let at_cap = self.stack.layers.len() >= MAX_LAYERS;
+            ui.label("Tiles:");
+            let tiles_label = format!("{}×{}", self.quad_tiles, self.quad_tiles);
+            egui::ComboBox::from_id_salt("quad_tiles")
+                .selected_text(tiles_label)
+                .width(60.0)
+                .show_ui(ui, |ui| {
+                    for &t in &[2u32, 4, 8, 16, 32, 64] {
+                        let lbl = format!("{t}×{t}");
+                        ui.selectable_value(&mut self.quad_tiles, t, lbl);
+                    }
+                });
+            if ui.add_enabled(!at_cap, egui::Button::new("Quad"))
+                .on_hover_text("Mirror-tile active layer into N×N grid on a new layer above it")
+                .clicked()
+            {
+                if at_cap {
+                    self.status = format!("Layer cap ({MAX_LAYERS}) reached — cannot Quad");
+                } else {
+                    let n        = self.quad_tiles as usize;
+                    let src_name = self.active_name();
+                    let src      = &self.stack.layers[self.active];
+                    let sw       = src.width  as usize;
+                    let sh       = src.height as usize;
+                    let new_rgba = quad_fn(&src.rgba, sw, sh, n);
+                    let mut new_layer    = Layer::new(src.width, src.height, [0.0; 4]);
+                    new_layer.rgba       = new_rgba;
+                    new_layer.name       = format!("Quad {n}×{n}");
+                    let insert_at        = self.active + 1;
+                    self.stack.checkpoint();
+                    self.stack.layers.insert(insert_at, new_layer);
+                    self.thumb_insert(insert_at);
+                    self.active = insert_at;
+                    self.dirty  = true;
+                    self.marked.clear();
+                    self.status = format!("Quad {n}×{n} from \"{src_name}\"");
+                }
             }
         });
 
