@@ -6,6 +6,7 @@ use basecoat::edge::{aggr_to_n, edge};
 use basecoat::kaleido::kaleido;
 use basecoat::layers::*;
 use basecoat::plasma::{apply_plasma, H as IMG_H, W as IMG_W};
+use basecoat::qbist::{create_info, optimize, render as qbist_render};
 use basecoat::punch::punch;
 use eframe::egui;
 use png::{BitDepth, ColorType, Encoder, Unit};
@@ -170,6 +171,10 @@ struct BasecoatApp {
     plasma_seed_str:    String,
     plasma_turbulence:  f32,
 
+    qbist_seed:         u64,
+    qbist_seed_str:     String,
+    qbist_oversampling: u8,
+
     punch_contrast:   f32,
     punch_saturation: f32,
     punch_passes:     u32,
@@ -211,6 +216,10 @@ impl BasecoatApp {
             plasma_seed:       0,
             plasma_seed_str:   "0".into(),
             plasma_turbulence: 1.0,
+
+            qbist_seed:         0,
+            qbist_seed_str:     "0".into(),
+            qbist_oversampling: 4,
 
             punch_contrast:   9.0,
             punch_saturation: 4.0,
@@ -1022,6 +1031,69 @@ impl BasecoatApp {
                 self.thumb_invalidate(idx);
                 let name = self.active_name();
                 self.status = format!("Plasma on {name} (seed={seed})");
+            }
+        });
+
+        // ---- Qbist ----
+        ui.separator();
+        ui.heading("Qbist");
+        ui.horizontal(|ui| {
+            ui.label("Seed:");
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.qbist_seed_str).desired_width(90.0),
+            );
+            if resp.lost_focus() || resp.changed() {
+                // Accept decimal or 0x-prefixed hex
+                let parsed = if let Some(h) = self.qbist_seed_str
+                    .strip_prefix("0x")
+                    .or_else(|| self.qbist_seed_str.strip_prefix("0X"))
+                {
+                    u64::from_str_radix(h, 16).ok()
+                } else {
+                    self.qbist_seed_str.parse::<u64>().ok()
+                };
+                if let Some(v) = parsed {
+                    self.qbist_seed = v;
+                }
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Oversampling:");
+            let mut os = self.qbist_oversampling as i32;
+            if ui.add(egui::DragValue::new(&mut os).range(1..=4)).changed() {
+                self.qbist_oversampling = os as u8;
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui.button("New Seed").clicked() {
+                self.qbist_seed     = time_seed();
+                self.qbist_seed_str = self.qbist_seed.to_string();
+            }
+            if ui.button("Apply").clicked() {
+                let seed = self.qbist_seed;
+                let os   = self.qbist_oversampling as usize;
+                let idx  = self.active;
+                let w    = self.stack.layers[idx].width  as usize;
+                let h    = self.stack.layers[idx].height as usize;
+                // Structural undo checkpoint — single Undo reverts the whole fill.
+                self.stack.checkpoint();
+                let mut genome = create_info(seed);
+                let (used_trans, used_reg) = optimize(&mut genome);
+                // qbist renders sRGB u8 directly (no gamma on the way out).
+                // Layer buffer is linear-light f32 — convert before writing.
+                let pixels = qbist_render(&genome, &used_trans, &used_reg, w, h, os);
+                let layer  = &mut self.stack.layers[idx];
+                for i in 0..w * h {
+                    let s = i * 4;
+                    layer.rgba[s    ] = srgb_to_linear(pixels[s    ] as f32 / 255.0);
+                    layer.rgba[s + 1] = srgb_to_linear(pixels[s + 1] as f32 / 255.0);
+                    layer.rgba[s + 2] = srgb_to_linear(pixels[s + 2] as f32 / 255.0);
+                    layer.rgba[s + 3] = 1.0;
+                }
+                self.dirty = true;
+                self.thumb_invalidate(idx);
+                let name = self.active_name();
+                self.status = format!("Qbist on {name} (seed={seed} os={os})");
             }
         });
 
