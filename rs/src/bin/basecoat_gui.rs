@@ -503,10 +503,18 @@ impl BasecoatApp {
         self.dirty   = false;
     }
 
-    fn active_name(&self) -> String {
-        self.stack.layers.get(self.active)
-            .map(|l| if l.name.is_empty() { format!("Layer {}", self.active) } else { l.name.clone() })
-            .unwrap_or_default()
+    fn layer_label(&self, idx: usize) -> String {
+        self.stack.layers.get(idx)
+            .map(|l| if l.name.is_empty() { format!("Layer {idx}") } else { l.name.clone() })
+            .unwrap_or_else(|| format!("Layer {idx}"))
+    }
+
+    /// Index of the topmost (highest-index = visually top) unlocked layer.
+    /// Returns None when the stack is empty or every layer is locked.
+    fn top_target(&self) -> Option<usize> {
+        self.stack.layers.iter().enumerate().rev()
+            .find(|(_, l)| !l.locked)
+            .map(|(i, _)| i)
     }
 
     fn clamp_active(&mut self) {
@@ -819,6 +827,8 @@ impl BasecoatApp {
 
         // Collect pick result here to avoid borrow conflict when mutating self later.
         let mut pick_result: Option<(Vec<f32>, usize, usize)> = None;
+        // Resolve outside the closure so top_target() doesn't force capture of &mut self whole.
+        let pick_src = self.top_target().unwrap_or(0);
 
         egui::ScrollArea::both().id_salt("canvas_scroll").show(ui, |ui| {
             let offset_rect = egui::Rect::from_min_size(ui.cursor().min + self.pan, display_size);
@@ -920,8 +930,7 @@ impl BasecoatApp {
                     // to selection.rs.
                     let aggr    = (self.selection_aggr    / 100.0).powf(AGGR_GAMMA)    * 100.0;
                     let feather = (self.selection_feather / 100.0).powf(FEATHER_GAMMA) * 100.0;
-                    let active  = self.active;
-                    if let Some(layer) = self.stack.layers.get(active) {
+                    if let Some(layer) = self.stack.layers.get(pick_src) {
                         let src = (py * W as usize + px) * 4;
                         if src + 2 < layer.rgba.len() {
                             let pr = layer.rgba[src    ];
@@ -973,9 +982,13 @@ impl BasecoatApp {
     // ---- Band generator ---------------------------------------------------
 
     fn run_band_generate(&mut self) {
-        if self.stack.layers.is_empty() { return; }
-
-        let seed_idx = self.active;
+        let seed_idx = match self.top_target() {
+            Some(i) => i,
+            None => {
+                self.status = "No unlocked layer to generate bands from".into();
+                return;
+            }
+        };
         let growth   = self.band_growth;
         let fill     = self.band_fill;
 
@@ -1069,8 +1082,7 @@ impl BasecoatApp {
         let mut sorted: Vec<usize> = self.marked.iter().copied().collect();
         sorted.sort_unstable();
 
-        eprintln!("[kaleido] marks={:?} active={} stack_len={}",
-                  sorted, self.active, self.stack.layers.len());
+        eprintln!("[kaleido] marks={:?} stack_len={}", sorted, self.stack.layers.len());
 
         // When no layers are marked, kaleido does nothing and shows a hint.
         // (Previously fell back to active layer — removed to prevent silent mis-targeting.)
@@ -1317,22 +1329,24 @@ impl BasecoatApp {
                     }
                 });
             if ui.add_enabled(!at_cap, egui::Button::new("Quad"))
-                .on_hover_text("Mirror-tile active layer into N×N grid on a new layer above it")
+                .on_hover_text("Mirror-tile top unlocked layer into N×N grid on a new layer above it")
                 .clicked()
             {
                 if at_cap {
                     self.status = format!("Layer cap ({MAX_LAYERS}) reached — cannot Quad");
-                } else {
+                } else if let Some(src_i) = self.top_target() {
                     let n        = self.quad_tiles as usize;
-                    let src_name = self.active_name();
-                    let src      = &self.stack.layers[self.active];
-                    let sw       = src.width  as usize;
-                    let sh       = src.height as usize;
-                    let new_rgba = quad_fn(&src.rgba, sw, sh, n);
-                    let mut new_layer    = Layer::new(src.width, src.height, [0.0; 4]);
+                    let src_name = self.layer_label(src_i);
+                    let (src_w, src_h, new_rgba) = {
+                        let src = &self.stack.layers[src_i];
+                        let sw  = src.width  as usize;
+                        let sh  = src.height as usize;
+                        (src.width, src.height, quad_fn(&src.rgba, sw, sh, n))
+                    };
+                    let mut new_layer    = Layer::new(src_w, src_h, [0.0; 4]);
                     new_layer.rgba       = new_rgba;
                     new_layer.name       = format!("Quad {n}×{n}");
-                    let insert_at        = self.active + 1;
+                    let insert_at        = src_i + 1;
                     self.stack.checkpoint();
                     self.stack.layers.insert(insert_at, new_layer);
                     self.thumb_insert(insert_at);
@@ -1340,6 +1354,8 @@ impl BasecoatApp {
                     self.dirty  = true;
                     self.marked.clear();
                     self.status = format!("Quad {n}×{n} from \"{src_name}\"");
+                } else {
+                    self.status = "No unlocked layer to Quad from".into();
                 }
             }
         });
@@ -1477,10 +1493,10 @@ impl BasecoatApp {
                 }
             });
 
-        // ---- Active layer detail (mode, opacity) ----
+        // ---- Editing layer detail (mode, opacity) ----
         if let Some(layer) = self.stack.layers.get_mut(self.active) {
             ui.separator();
-            ui.label(format!("Active: {}",
+            ui.label(format!("Editing: {}",
                 if layer.name.is_empty() { format!("Layer {}", self.active) } else { layer.name.clone() }
             ));
             ui.horizontal(|ui| {
@@ -1553,44 +1569,60 @@ impl BasecoatApp {
         ui.separator();
         ui.heading("Adjustments");
         if ui.button("Invert")
-            .on_hover_text("Perceptual (sRGB) invert — whole layer or clipped to selection")
+            .on_hover_text("Perceptual (sRGB) invert — all unlocked layers, clipped to selection if active")
             .clicked()
         {
             if self.stack.layers.is_empty() {
-                self.status = "Invert: no active layer".into();
+                self.status = "Invert: no layers".into();
+            } else if self.stack.layers.iter().all(|l| l.locked) {
+                self.status = "All layers locked — nothing to invert".into();
             } else {
-                let idx  = self.active;
-                let name = self.active_name();
-                if self.stack.layers[idx].locked {
-                    self.status = format!("Layer \"{name}\" is locked — skipped");
-                } else {
-                let lw   = self.stack.layers[idx].width  as usize;
-                let lh   = self.stack.layers[idx].height as usize;
-                let n_px = lw * lh;
-
-                let mask_matches = self.stack.has_selection && self.stack.selection_mask.len() == n_px;
-                // Clone the mask before the mutable borrow in snapshot_layer; the
-                // immutable borrow of self.stack.selection_mask must not outlive it.
-                let mask_clone: Option<Vec<f32>> = if mask_matches {
+                // Clone the mask once before the checkpoint borrow so the
+                // immutable borrow of selection_mask doesn't conflict with
+                // the mutable borrow inside checkpoint().
+                let mask_snap: Option<Vec<f32>> = if self.stack.has_selection {
                     Some(self.stack.selection_mask.clone())
                 } else {
                     None
                 };
 
-                self.stack.snapshot_layer(idx);
-                adjust_invert(&mut self.stack.layers[idx].rgba, mask_clone.as_deref());
-                self.dirty = true;
-                self.thumb_invalidate(idx);
+                // One structural snapshot covers all layers atomically —
+                // a single Undo reverts the entire multi-layer invert.
+                self.stack.checkpoint();
 
-                self.status = if mask_matches {
-                    format!("Inverted selection on {name}")
-                } else if self.stack.has_selection {
-                    // mask existed but dims didn't match — fell back to whole layer
-                    format!("Inverted {name} (selection size mismatch — whole layer)")
+                let n = self.stack.layers.len();
+                let mut n_inverted = 0usize;
+                let mut n_skipped  = 0usize;
+
+                for i in 0..n {
+                    if self.stack.layers[i].locked {
+                        n_skipped += 1;
+                        continue;
+                    }
+                    let n_px = (self.stack.layers[i].width
+                                * self.stack.layers[i].height) as usize;
+                    // Use the global mask when it covers this layer's pixel count.
+                    let mask_ref = mask_snap.as_deref().and_then(|m| {
+                        if m.len() == n_px { Some(m) } else { None }
+                    });
+                    adjust_invert(&mut self.stack.layers[i].rgba, mask_ref);
+                    self.thumb_invalidate(i);
+                    n_inverted += 1;
+                }
+
+                self.dirty  = true;
+                self.status = if n_skipped > 0 {
+                    format!(
+                        "Inverted {} of {} layers ({} locked, skipped)",
+                        n_inverted, n, n_skipped,
+                    )
                 } else {
-                    format!("Inverted {name}")
+                    format!(
+                        "Inverted {} layer{}",
+                        n_inverted,
+                        if n_inverted == 1 { "" } else { "s" },
+                    )
                 };
-                } // end locked-else
             }
         }
 
@@ -1617,26 +1649,25 @@ impl BasecoatApp {
             if ui.add_enabled(!in_flight, egui::Button::new("Apply")).clicked() {
                 let seed = self.plasma_seed;
                 let turb = self.plasma_turbulence as f64;
-                let idx  = self.active;
-                let name = self.active_name();
-                if self.stack.layers[idx].locked {
-                    self.status = format!("Layer \"{name}\" is locked — skipped");
+                if let Some(idx) = self.top_target() {
+                    let name = self.layer_label(idx);
+                    self.stack.checkpoint();
+                    let progress = Arc::new(AtomicU32::new(0));
+                    self.render_progress   = Arc::clone(&progress);
+                    self.render_total_rows = IMG_H;
+                    self.render_target_idx = idx;
+                    self.render_finish     = format!("Plasma on \"{name}\" (seed={seed})");
+                    self.render_label      = "Plasma".into();
+                    let (tx, rx) = mpsc::channel();
+                    self.render_rx = Some(rx);
+                    std::thread::spawn(move || {
+                        let mut buf = vec![0.0f32; IMG_W * IMG_H * 4];
+                        apply_plasma_with_progress(&mut buf, seed, turb, &progress);
+                        let _ = tx.send(RenderBuf::Linear(buf));
+                    });
                 } else {
-                self.stack.checkpoint();
-                let progress = Arc::new(AtomicU32::new(0));
-                self.render_progress   = Arc::clone(&progress);
-                self.render_total_rows = IMG_H;
-                self.render_target_idx = idx;
-                self.render_finish     = format!("Plasma on {name} (seed={seed})");
-                self.render_label      = "Plasma".into();
-                let (tx, rx) = mpsc::channel();
-                self.render_rx = Some(rx);
-                std::thread::spawn(move || {
-                    let mut buf = vec![0.0f32; IMG_W * IMG_H * 4];
-                    apply_plasma_with_progress(&mut buf, seed, turb, &progress);
-                    let _ = tx.send(RenderBuf::Linear(buf));
-                });
-                } // end locked-else
+                    self.status = "No unlocked layer to generate onto".into();
+                }
             }
         });
         if self.render_rx.is_some() && self.render_label == "Plasma" {
@@ -1690,31 +1721,30 @@ impl BasecoatApp {
             if ui.add_enabled(!in_flight, egui::Button::new("Apply")).clicked() {
                 let seed = self.qbist_seed;
                 let os   = self.qbist_oversampling as usize;
-                let idx  = self.active;
-                let w    = self.stack.layers[idx].width  as usize;
-                let h    = self.stack.layers[idx].height as usize;
-                let name = self.active_name();
-                if self.stack.layers[idx].locked {
-                    self.status = format!("Layer \"{name}\" is locked — skipped");
+                if let Some(idx) = self.top_target() {
+                    let w    = self.stack.layers[idx].width  as usize;
+                    let h    = self.stack.layers[idx].height as usize;
+                    let name = self.layer_label(idx);
+                    let mut genome = create_info(seed);
+                    let (used_trans, used_reg) = optimize(&mut genome);
+                    self.stack.checkpoint();
+                    let progress = Arc::new(AtomicU32::new(0));
+                    self.render_progress   = Arc::clone(&progress);
+                    self.render_total_rows = h;
+                    self.render_target_idx = idx;
+                    self.render_finish     = format!("Qbist on \"{name}\" (seed={seed} os={os})");
+                    self.render_label      = "Qbist".into();
+                    let (tx, rx) = mpsc::channel();
+                    self.render_rx = Some(rx);
+                    std::thread::spawn(move || {
+                        let buf = qbist_render_threaded(
+                            &genome, &used_trans, &used_reg, w, h, os, &progress,
+                        );
+                        let _ = tx.send(RenderBuf::SrgbU8(buf));
+                    });
                 } else {
-                let mut genome = create_info(seed);
-                let (used_trans, used_reg) = optimize(&mut genome);
-                self.stack.checkpoint();
-                let progress = Arc::new(AtomicU32::new(0));
-                self.render_progress   = Arc::clone(&progress);
-                self.render_total_rows = h;
-                self.render_target_idx = idx;
-                self.render_finish     = format!("Qbist on {name} (seed={seed} os={os})");
-                self.render_label      = "Qbist".into();
-                let (tx, rx) = mpsc::channel();
-                self.render_rx = Some(rx);
-                std::thread::spawn(move || {
-                    let buf = qbist_render_threaded(
-                        &genome, &used_trans, &used_reg, w, h, os, &progress,
-                    );
-                    let _ = tx.send(RenderBuf::SrgbU8(buf));
-                });
-                } // end locked-else
+                    self.status = "No unlocked layer to generate onto".into();
+                }
             }
         });
         if self.render_rx.is_some() && self.render_label == "Qbist" {
@@ -1781,30 +1811,29 @@ impl BasecoatApp {
                         1.0,
                     ]
                 };
-                let idx  = self.active;
-                let w    = self.stack.layers[idx].width  as usize;
-                let h    = self.stack.layers[idx].height as usize;
-                let name = self.active_name();
-                if self.stack.layers[idx].locked {
-                    self.status = format!("Layer \"{name}\" is locked — skipped");
+                if let Some(idx) = self.top_target() {
+                    let w    = self.stack.layers[idx].width  as usize;
+                    let h    = self.stack.layers[idx].height as usize;
+                    let name = self.layer_label(idx);
+                    self.stack.checkpoint();
+                    let progress = Arc::new(AtomicU32::new(0));
+                    self.render_progress   = Arc::clone(&progress);
+                    self.render_total_rows = h;
+                    self.render_target_idx = idx;
+                    self.render_finish     = format!("Spiral on \"{name}\"");
+                    self.render_label      = "Spiral".into();
+                    let (tx, rx) = mpsc::channel();
+                    self.render_rx = Some(rx);
+                    std::thread::spawn(move || {
+                        let mut buf = vec![0.0f32; w * h * 4];
+                        spiral_render_threaded(
+                            &mut buf, w, h, ca, cb, kind, turns, arms, SPIRAL_OS, &progress,
+                        );
+                        let _ = tx.send(RenderBuf::Linear(buf));
+                    });
                 } else {
-                self.stack.checkpoint();
-                let progress = Arc::new(AtomicU32::new(0));
-                self.render_progress   = Arc::clone(&progress);
-                self.render_total_rows = h;
-                self.render_target_idx = idx;
-                self.render_finish     = format!("Spiral on {name}");
-                self.render_label      = "Spiral".into();
-                let (tx, rx) = mpsc::channel();
-                self.render_rx = Some(rx);
-                std::thread::spawn(move || {
-                    let mut buf = vec![0.0f32; w * h * 4];
-                    spiral_render_threaded(
-                        &mut buf, w, h, ca, cb, kind, turns, arms, SPIRAL_OS, &progress,
-                    );
-                    let _ = tx.send(RenderBuf::Linear(buf));
-                });
-                } // end locked-else
+                    self.status = "No unlocked layer to generate onto".into();
+                }
             }
         }
         if self.render_rx.is_some() && self.render_label == "Spiral" {
@@ -1839,38 +1868,36 @@ impl BasecoatApp {
             let k    = self.punch_contrast;
             let sat  = self.punch_saturation;
             let pass = self.punch_passes;
-            let idx  = self.active;
-            let name = self.active_name();
-            if self.stack.layers[idx].locked {
-                self.status = format!("Layer \"{name}\" is locked — skipped");
-            } else {
-            let lw   = self.stack.layers[idx].width  as usize;
-            let lh   = self.stack.layers[idx].height as usize;
-            let n_px = lw * lh;
-            let use_mask = self.stack.has_selection && self.stack.selection_mask.len() == n_px;
-            self.stack.snapshot_layer(idx);
-            // Clone pre-punch pixels for masked blend (only when selection is active).
-            let pre_punch = if use_mask {
-                Some(self.stack.layers[idx].rgba.clone())
-            } else {
-                None
-            };
-            punch(&mut self.stack.layers[idx].rgba, k, sat, pass);
-            if let Some(old) = pre_punch {
-                for i in 0..n_px {
-                    let m = self.stack.selection_mask[i];
-                    let s = i * 4;
-                    for c in 0..4usize {
-                        let punched = self.stack.layers[idx].rgba[s + c];
-                        self.stack.layers[idx].rgba[s + c] =
-                            old[s + c] * (1.0 - m) + punched * m;
+            if let Some(idx) = self.top_target() {
+                let name = self.layer_label(idx);
+                let lw   = self.stack.layers[idx].width  as usize;
+                let lh   = self.stack.layers[idx].height as usize;
+                let n_px = lw * lh;
+                let use_mask = self.stack.has_selection && self.stack.selection_mask.len() == n_px;
+                self.stack.snapshot_layer(idx);
+                let pre_punch = if use_mask {
+                    Some(self.stack.layers[idx].rgba.clone())
+                } else {
+                    None
+                };
+                punch(&mut self.stack.layers[idx].rgba, k, sat, pass);
+                if let Some(old) = pre_punch {
+                    for i in 0..n_px {
+                        let m = self.stack.selection_mask[i];
+                        let s = i * 4;
+                        for c in 0..4usize {
+                            let punched = self.stack.layers[idx].rgba[s + c];
+                            self.stack.layers[idx].rgba[s + c] =
+                                old[s + c] * (1.0 - m) + punched * m;
+                        }
                     }
                 }
+                self.dirty = true;
+                self.thumb_invalidate(idx);
+                self.status = format!("Punch on \"{name}\" (k={k:.1} sat={sat:.1} ×{pass})");
+            } else {
+                self.status = "No unlocked layer to generate onto".into();
             }
-            self.dirty = true;
-            self.thumb_invalidate(idx);
-            self.status = format!("Punch on {name} (k={k:.1} sat={sat:.1} ×{pass})");
-            } // end locked-else
         }
 
         // ---- Edge ----
@@ -1887,24 +1914,30 @@ impl BasecoatApp {
             let mut w = self.edge_width as i32;
             if ui.add(egui::Slider::new(&mut w, 1..=7)).changed() { self.edge_width = w as usize; }
         });
-        if ui.button("Apply Edge").clicked() && !self.stack.layers.is_empty() {
+        if ui.button("Apply Edge").clicked() {
             let aggr  = self.edge_aggr;
             let width = self.edge_width;
-            let idx   = self.active;
-            self.stack.checkpoint();
-            let src      = &self.stack.layers[idx];
-            let (pw, ph) = (src.width as usize, src.height as usize);
-            let edge_buf = edge(&src.rgba.clone(), pw, ph, aggr, width);
-            let mut edge_layer    = Layer::new(pw as u32, ph as u32, [0.0; 4]);
-            edge_layer.rgba       = edge_buf;
-            edge_layer.name       = "edge".into();
-            self.stack.layers.insert(idx + 1, edge_layer);
-            self.thumb_insert(idx + 1);
-            self.marked.clear();
-            self.active = idx + 1;
-            self.dirty  = true;
-            let n = aggr_to_n(aggr);
-            self.status = format!("Edge layer created (N={n} w={width})");
+            if let Some(idx) = self.top_target() {
+                self.stack.checkpoint();
+                let (pw, ph, edge_buf) = {
+                    let src = &self.stack.layers[idx];
+                    let pw  = src.width  as usize;
+                    let ph  = src.height as usize;
+                    (pw, ph, edge(&src.rgba.clone(), pw, ph, aggr, width))
+                };
+                let mut edge_layer    = Layer::new(pw as u32, ph as u32, [0.0; 4]);
+                edge_layer.rgba       = edge_buf;
+                edge_layer.name       = "edge".into();
+                self.stack.layers.insert(idx + 1, edge_layer);
+                self.thumb_insert(idx + 1);
+                self.marked.clear();
+                self.active = idx + 1;
+                self.dirty  = true;
+                let n = aggr_to_n(aggr);
+                self.status = format!("Edge layer created (N={n} w={width})");
+            } else {
+                self.status = "No unlocked layer to edge-detect".into();
+            }
         }
 
         // ---- Band Generator ----
