@@ -57,6 +57,7 @@ pub fn kaleido(source: &Layer, segments: u32, rotation_deg: f64, zoom: f64) -> L
         mode:    BlendMode::Normal,
         opacity: 1.0,
         visible: true,
+        locked:  false,
         name:    "kaleido".into(),
     }
 }

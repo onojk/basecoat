@@ -12,7 +12,7 @@ fn solid_layer(r: f32, g: f32, b: f32, a: f32) -> Layer {
         .map(|i| match i % 4 { 0 => r, 1 => g, 2 => b, _ => a })
         .collect();
     Layer { rgba, width: SIZE as u32, height: SIZE as u32,
-            mode: BlendMode::Normal, opacity: 1.0, visible: true, name: String::new() }
+            mode: BlendMode::Normal, opacity: 1.0, visible: true, locked: false, name: String::new() }
 }
 
 fn spot_layer(px: usize, py: usize, r: f32, g: f32, b: f32) -> Layer {
@@ -192,7 +192,7 @@ fn test_gradient_plus_edge_kaleido() {
     let color_layer = Layer {
         rgba:    grad_rgba.clone(),
         width:   size as u32, height: size as u32,
-        mode:    BlendMode::Normal, opacity: 1.0, visible: true, name: String::new(),
+        mode:    BlendMode::Normal, opacity: 1.0, visible: true, locked: false, name: String::new(),
     };
 
     // Layer 1 (top): edge layer from gradient — opaque black lines, transparent elsewhere
@@ -200,7 +200,7 @@ fn test_gradient_plus_edge_kaleido() {
     let lines_layer = Layer {
         rgba:    edge_buf.clone(),
         width:   size as u32, height: size as u32,
-        mode:    BlendMode::Normal, opacity: 1.0, visible: true, name: String::new(),
+        mode:    BlendMode::Normal, opacity: 1.0, visible: true, locked: false, name: String::new(),
     };
 
     // Count edge pixels in lines_layer

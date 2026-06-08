@@ -138,7 +138,7 @@ fn test_per_layer_opacity() {
     fn solid(r: f32, g: f32, b: f32, a: f32, opacity: f32) -> Layer {
         let rgba = (0..4).map(|i| [r, g, b, a][i]).cycle().take(4).collect();
         Layer { rgba, width: 1, height: 1, mode: BlendMode::Normal,
-                opacity, visible: true, name: String::new() }
+                opacity, visible: true, locked: false, name: String::new() }
     }
 
     // Layer 0 (bottom): solid red, full opacity

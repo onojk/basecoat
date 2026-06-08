@@ -205,6 +205,51 @@ fn time_seed() -> u64 {
         .unwrap_or(12345)
 }
 
+/// Draw a padlock icon inside `rect`.
+/// Locked → filled amber body + closed shackle arc.
+/// Unlocked → faint grey outline body + raised (open) shackle arc.
+fn draw_lock_icon(painter: &egui::Painter, rect: egui::Rect, locked: bool) {
+    use std::f32::consts::PI;
+
+    let cx     = rect.center().x;
+    let top    = rect.top() + 1.0;
+    let bottom = rect.bottom() - 1.0;
+    let h      = bottom - top;
+
+    // Body: lower 50% of the usable area.
+    let body_h    = h * 0.50;
+    let body_w    = rect.width() * 0.60;
+    let body_y    = bottom - body_h; // y of body top edge
+    let body_rect = egui::Rect::from_min_size(
+        egui::pos2(cx - body_w / 2.0, body_y),
+        egui::vec2(body_w, body_h),
+    );
+
+    let shackle_r = body_w * 0.34;
+    const N: usize = 16;
+
+    if locked {
+        let color  = egui::Color32::from_rgb(220, 150, 40); // amber
+        painter.rect_filled(body_rect, 2.5, color);
+        // Closed shackle: arc legs rest on body_y.
+        let pts: Vec<egui::Pos2> = (0..=N).map(|i| {
+            let a = PI * i as f32 / N as f32;
+            egui::pos2(cx + shackle_r * a.cos(), body_y - shackle_r * a.sin())
+        }).collect();
+        painter.add(egui::Shape::line(pts, egui::Stroke::new(2.0, color)));
+    } else {
+        let col = egui::Color32::from_rgba_unmultiplied(160, 160, 160, 65);
+        painter.rect_stroke(body_rect, 2.5, egui::Stroke::new(1.0, col));
+        // Open shackle: raise the whole arc by `gap` so legs visibly clear the body.
+        let gap = body_h * 0.40;
+        let pts: Vec<egui::Pos2> = (0..=N).map(|i| {
+            let a = PI * i as f32 / N as f32;
+            egui::pos2(cx + shackle_r * a.cos(), body_y - gap - shackle_r * a.sin())
+        }).collect();
+        painter.add(egui::Shape::line(pts, egui::Stroke::new(1.0, col)));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // App state
 // ---------------------------------------------------------------------------
@@ -519,6 +564,12 @@ impl eframe::App for BasecoatApp {
                 let idx    = self.render_target_idx;
                 let status = std::mem::take(&mut self.render_finish);
                 if idx < self.stack.layers.len() {
+                    if self.stack.layers[idx].locked {
+                        self.status = format!(
+                            "{} render finished but layer is now locked — result discarded",
+                            self.render_label
+                        );
+                    } else {
                     let lw = self.stack.layers[idx].width  as usize;
                     let lh = self.stack.layers[idx].height as usize;
                     let n_px = lw * lh;
@@ -577,6 +628,7 @@ impl eframe::App for BasecoatApp {
                     self.dirty = true;
                     self.thumb_invalidate(idx);
                     self.status = status;
+                    } // end locked-else
                 } else {
                     self.status = format!(
                         "{} render finished but target layer was deleted — result discarded",
@@ -1123,6 +1175,7 @@ impl BasecoatApp {
                         d.mode     = src.mode;
                         d.opacity  = src.opacity;
                         d.visible  = src.visible;
+                        d.locked   = src.locked;
                         d.name     = name.clone();
                         (d, name)
                     };
@@ -1303,14 +1356,14 @@ impl BasecoatApp {
                     let is_active = display_i == self.active;
 
                     // Pre-collect read-only state (avoids borrow conflicts in the Frame closure)
-                    let (label, visible, is_marked, thumb_id, opacity) = {
+                    let (label, visible, is_marked, thumb_id, opacity, locked) = {
                         let l = &self.stack.layers[display_i];
                         let lbl = if l.name.is_empty() { format!("Layer {display_i}") } else { l.name.clone() };
                         let tid = self.thumb_textures
                             .get(display_i)
                             .and_then(|o| o.as_ref())
                             .map(|t| t.id());
-                        (lbl, l.visible, self.marked.contains(&display_i), tid, l.opacity)
+                        (lbl, l.visible, self.marked.contains(&display_i), tid, l.opacity, l.locked)
                     };
 
                     // Active row highlight; marked rows get a secondary tint
@@ -1330,6 +1383,7 @@ impl BasecoatApp {
                             let mut eye_clicked   = false;
                             let mut label_clicked = false;
                             let mut new_opacity   = opacity;
+                            let mut lock_clicked  = false;
 
                             ui.horizontal(|ui| {
                                 // Checkbox (mark)
@@ -1358,6 +1412,24 @@ impl BasecoatApp {
                                 let eye = if visible { "Vis" } else { "Hid" };
                                 if ui.small_button(eye).clicked() { eye_clicked = true; }
 
+                                // Lock toggle — drawn padlock icon; amber when locked, faint when open.
+                                let (lock_rect, lock_resp) = ui.allocate_exact_size(
+                                    egui::vec2(18.0, 18.0),
+                                    egui::Sense::click(),
+                                );
+                                if ui.is_rect_visible(lock_rect) {
+                                    // Subtle hover highlight so it reads as a button.
+                                    if lock_resp.hovered() {
+                                        ui.painter().rect_filled(
+                                            lock_rect,
+                                            2.0,
+                                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 18),
+                                        );
+                                    }
+                                    draw_lock_icon(ui.painter(), lock_rect, locked);
+                                }
+                                if lock_resp.clicked() { lock_clicked = true; }
+
                                 // Per-row opacity — drag left/right, or double-click to type
                                 ui.add(
                                     egui::DragValue::new(&mut new_opacity)
@@ -1372,7 +1444,7 @@ impl BasecoatApp {
                                 }
                             });
 
-                            (new_marked, eye_clicked, label_clicked, new_opacity)
+                            (new_marked, eye_clicked, label_clicked, new_opacity, lock_clicked)
                         });
 
                     // Apply interactions (after the closure so no borrow conflicts).
@@ -1398,6 +1470,9 @@ impl BasecoatApp {
                     if (new_op - opacity).abs() > 1e-4 {
                         self.stack.layers[display_i].opacity = new_op;
                         self.dirty = true;
+                    }
+                    if resp.inner.4 {
+                        self.stack.layers[display_i].locked ^= true;
                     }
                 }
             });
@@ -1486,6 +1561,9 @@ impl BasecoatApp {
             } else {
                 let idx  = self.active;
                 let name = self.active_name();
+                if self.stack.layers[idx].locked {
+                    self.status = format!("Layer \"{name}\" is locked — skipped");
+                } else {
                 let lw   = self.stack.layers[idx].width  as usize;
                 let lh   = self.stack.layers[idx].height as usize;
                 let n_px = lw * lh;
@@ -1512,6 +1590,7 @@ impl BasecoatApp {
                 } else {
                     format!("Inverted {name}")
                 };
+                } // end locked-else
             }
         }
 
@@ -1540,6 +1619,9 @@ impl BasecoatApp {
                 let turb = self.plasma_turbulence as f64;
                 let idx  = self.active;
                 let name = self.active_name();
+                if self.stack.layers[idx].locked {
+                    self.status = format!("Layer \"{name}\" is locked — skipped");
+                } else {
                 self.stack.checkpoint();
                 let progress = Arc::new(AtomicU32::new(0));
                 self.render_progress   = Arc::clone(&progress);
@@ -1554,6 +1636,7 @@ impl BasecoatApp {
                     apply_plasma_with_progress(&mut buf, seed, turb, &progress);
                     let _ = tx.send(RenderBuf::Linear(buf));
                 });
+                } // end locked-else
             }
         });
         if self.render_rx.is_some() && self.render_label == "Plasma" {
@@ -1611,6 +1694,9 @@ impl BasecoatApp {
                 let w    = self.stack.layers[idx].width  as usize;
                 let h    = self.stack.layers[idx].height as usize;
                 let name = self.active_name();
+                if self.stack.layers[idx].locked {
+                    self.status = format!("Layer \"{name}\" is locked — skipped");
+                } else {
                 let mut genome = create_info(seed);
                 let (used_trans, used_reg) = optimize(&mut genome);
                 self.stack.checkpoint();
@@ -1628,6 +1714,7 @@ impl BasecoatApp {
                     );
                     let _ = tx.send(RenderBuf::SrgbU8(buf));
                 });
+                } // end locked-else
             }
         });
         if self.render_rx.is_some() && self.render_label == "Qbist" {
@@ -1698,6 +1785,9 @@ impl BasecoatApp {
                 let w    = self.stack.layers[idx].width  as usize;
                 let h    = self.stack.layers[idx].height as usize;
                 let name = self.active_name();
+                if self.stack.layers[idx].locked {
+                    self.status = format!("Layer \"{name}\" is locked — skipped");
+                } else {
                 self.stack.checkpoint();
                 let progress = Arc::new(AtomicU32::new(0));
                 self.render_progress   = Arc::clone(&progress);
@@ -1714,6 +1804,7 @@ impl BasecoatApp {
                     );
                     let _ = tx.send(RenderBuf::Linear(buf));
                 });
+                } // end locked-else
             }
         }
         if self.render_rx.is_some() && self.render_label == "Spiral" {
@@ -1749,6 +1840,10 @@ impl BasecoatApp {
             let sat  = self.punch_saturation;
             let pass = self.punch_passes;
             let idx  = self.active;
+            let name = self.active_name();
+            if self.stack.layers[idx].locked {
+                self.status = format!("Layer \"{name}\" is locked — skipped");
+            } else {
             let lw   = self.stack.layers[idx].width  as usize;
             let lh   = self.stack.layers[idx].height as usize;
             let n_px = lw * lh;
@@ -1774,8 +1869,8 @@ impl BasecoatApp {
             }
             self.dirty = true;
             self.thumb_invalidate(idx);
-            let name = self.active_name();
             self.status = format!("Punch on {name} (k={k:.1} sat={sat:.1} ×{pass})");
+            } // end locked-else
         }
 
         // ---- Edge ----

@@ -57,7 +57,7 @@ fn gradient_layer(size: usize) -> Layer {
     let buf = gradient(size);
     Layer { rgba: buf, width: size as u32, height: size as u32,
             mode: basecoat::layers::BlendMode::Normal,
-            opacity: 1.0, visible: true, name: String::new() }
+            opacity: 1.0, visible: true, locked: false, name: String::new() }
 }
 
 // ---------------------------------------------------------------------------

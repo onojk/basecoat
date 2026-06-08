@@ -64,6 +64,8 @@ pub struct Layer {
     pub mode: BlendMode,
     pub opacity: f32,
     pub visible: bool,
+    /// When true, pixel-modifying ops (invert, technique fills) are skipped on this layer.
+    pub locked: bool,
     pub name: String,
 }
 
@@ -78,6 +80,7 @@ impl Layer {
             mode: BlendMode::Normal,
             opacity: 1.0,
             visible: true,
+            locked: false,
             name: String::new(),
         }
     }
@@ -159,6 +162,7 @@ pub fn composite(layers: &[Layer]) -> Layer {
         mode: BlendMode::Normal,
         opacity: 1.0,
         visible: true,
+        locked: false,
         name: String::new(),
     }
 }

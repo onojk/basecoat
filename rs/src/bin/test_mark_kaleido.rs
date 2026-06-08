@@ -10,7 +10,7 @@ fn solid(r: f32, g: f32, b: f32) -> Layer {
     let n = (SZ * SZ * 4) as usize;
     let rgba = (0..n).map(|i| match i % 4 { 0 => r, 1 => g, 2 => b, _ => 1.0 }).collect();
     Layer { rgba, width: SZ, height: SZ, mode: BlendMode::Normal,
-            opacity: 1.0, visible: true, name: String::new() }
+            opacity: 1.0, visible: true, locked: false, name: String::new() }
 }
 
 fn dominant_channel(layer: &Layer) -> &'static str {
