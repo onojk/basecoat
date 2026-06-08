@@ -9,3 +9,4 @@ pub mod qbist;
 pub mod quad;
 pub mod sample;
 pub mod selection;
+pub mod spiral;

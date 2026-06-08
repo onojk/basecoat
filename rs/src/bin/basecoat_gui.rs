@@ -8,6 +8,9 @@ use basecoat::kaleido::kaleido;
 use basecoat::layers::*;
 use basecoat::plasma::{apply_plasma_with_progress, H as IMG_H, W as IMG_W};
 use basecoat::qbist::{create_info, optimize, render_with_progress as qbist_render_threaded};
+use basecoat::spiral::{
+    render_with_progress as spiral_render_threaded, SpiralKind, OVERSAMPLING as SPIRAL_OS,
+};
 use basecoat::quad::quad as quad_fn;
 use basecoat::selection::{mask_coverage_pct, select_by_color, union_masks};
 use basecoat::punch::punch;
@@ -235,6 +238,12 @@ struct BasecoatApp {
     qbist_seed_str:     String,
     qbist_oversampling: u8,
 
+    spiral_kind:    SpiralKind,
+    spiral_turns:   u32,
+    spiral_arms:    u32,
+    spiral_color_a: [u8; 3],
+    spiral_color_b: [u8; 3],
+
     // Background render state — None when idle.
     render_rx:       Option<mpsc::Receiver<RenderBuf>>,
     render_progress: Arc<AtomicU32>,
@@ -306,6 +315,12 @@ impl BasecoatApp {
             qbist_seed:         0,
             qbist_seed_str:     "0".into(),
             qbist_oversampling: 4,
+
+            spiral_kind:    SpiralKind::Logarithmic,
+            spiral_turns:   8,
+            spiral_arms:    1,
+            spiral_color_a: [0,   0,   0  ],   // black (sRGB)
+            spiral_color_b: [255, 255, 255],   // white (sRGB)
 
             render_rx:         None,
             render_progress:   Arc::new(AtomicU32::new(0)),
@@ -1623,6 +1638,92 @@ impl BasecoatApp {
             ui.add(
                 egui::ProgressBar::new(frac)
                     .text(format!("Rendering qbist… {pct}%"))
+                    .animate(true),
+            );
+        }
+
+        // ---- Spiral ----
+        ui.separator();
+        ui.heading("Spiral");
+        ui.horizontal(|ui| {
+            ui.label("Type:");
+            ui.radio_value(&mut self.spiral_kind, SpiralKind::Logarithmic, "Logarithmic");
+            ui.radio_value(&mut self.spiral_kind, SpiralKind::Archimedean, "Archimedean");
+        });
+        ui.horizontal(|ui| {
+            ui.label("Turns:");
+            let mut t_i = self.spiral_turns as i32;
+            if ui.add(egui::Slider::new(&mut t_i, 2..=60)).changed() {
+                self.spiral_turns = t_i as u32;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Arms:");
+            let mut arms_i = self.spiral_arms as i32;
+            if ui.add(egui::Slider::new(&mut arms_i, 1..=12)).changed() {
+                self.spiral_arms = arms_i as u32;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Color A:");
+            egui::color_picker::color_edit_button_srgb(ui, &mut self.spiral_color_a);
+            ui.label("Color B:");
+            egui::color_picker::color_edit_button_srgb(ui, &mut self.spiral_color_b);
+        });
+        {
+            let in_flight = self.render_rx.is_some();
+            if ui.add_enabled(!in_flight, egui::Button::new("Apply Spiral")).clicked() {
+                let kind  = self.spiral_kind;
+                let turns = self.spiral_turns;
+                let arms  = self.spiral_arms;
+                let ca = {
+                    let [r, g, b] = self.spiral_color_a;
+                    [
+                        srgb_to_linear(r as f32 / 255.0),
+                        srgb_to_linear(g as f32 / 255.0),
+                        srgb_to_linear(b as f32 / 255.0),
+                        1.0,
+                    ]
+                };
+                let cb = {
+                    let [r, g, b] = self.spiral_color_b;
+                    [
+                        srgb_to_linear(r as f32 / 255.0),
+                        srgb_to_linear(g as f32 / 255.0),
+                        srgb_to_linear(b as f32 / 255.0),
+                        1.0,
+                    ]
+                };
+                let idx  = self.active;
+                let w    = self.stack.layers[idx].width  as usize;
+                let h    = self.stack.layers[idx].height as usize;
+                let name = self.active_name();
+                self.stack.checkpoint();
+                let progress = Arc::new(AtomicU32::new(0));
+                self.render_progress   = Arc::clone(&progress);
+                self.render_total_rows = h;
+                self.render_target_idx = idx;
+                self.render_finish     = format!("Spiral on {name}");
+                self.render_label      = "Spiral".into();
+                let (tx, rx) = mpsc::channel();
+                self.render_rx = Some(rx);
+                std::thread::spawn(move || {
+                    let mut buf = vec![0.0f32; w * h * 4];
+                    spiral_render_threaded(
+                        &mut buf, w, h, ca, cb, kind, turns, arms, SPIRAL_OS, &progress,
+                    );
+                    let _ = tx.send(RenderBuf::Linear(buf));
+                });
+            }
+        }
+        if self.render_rx.is_some() && self.render_label == "Spiral" {
+            let done  = self.render_progress.load(Ordering::Relaxed) as f32;
+            let total = self.render_total_rows as f32;
+            let frac  = if total > 0.0 { (done / total).min(1.0) } else { 0.0 };
+            let pct   = (frac * 100.0) as u32;
+            ui.add(
+                egui::ProgressBar::new(frac)
+                    .text(format!("Rendering spiral… {pct}%"))
                     .animate(true),
             );
         }
