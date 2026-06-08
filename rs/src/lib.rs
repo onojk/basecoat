@@ -1,3 +1,4 @@
+pub mod adjust;
 pub mod bands;
 pub mod edge;
 pub mod kaleido;
@@ -7,3 +8,4 @@ pub mod punch;
 pub mod qbist;
 pub mod quad;
 pub mod sample;
+pub mod selection;

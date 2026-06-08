@@ -1,6 +1,7 @@
 //! basecoat GUI — thin viewer/driver over the headless engine.
 //! egui/eframe + wgpu backend.
 
+use basecoat::adjust::invert as adjust_invert;
 use basecoat::bands::{generate_bands, growth_to_thickness};
 use basecoat::edge::{aggr_to_n, edge};
 use basecoat::kaleido::kaleido;
@@ -8,6 +9,7 @@ use basecoat::layers::*;
 use basecoat::plasma::{apply_plasma_with_progress, H as IMG_H, W as IMG_W};
 use basecoat::qbist::{create_info, optimize, render_with_progress as qbist_render_threaded};
 use basecoat::quad::quad as quad_fn;
+use basecoat::selection::{mask_coverage_pct, select_by_color, union_masks};
 use basecoat::punch::punch;
 use eframe::egui;
 use png::{BitDepth, ColorType, Encoder, Unit};
@@ -25,6 +27,25 @@ const PPM: u32 = 23622;
 
 const THUMB_SIZE: usize = 64;  // texture resolution
 const THUMB_PX:   f32   = 40.0; // display size in the layer row
+
+// Marching-ants tuning — change these to adjust outline appearance.
+const ANT_THICKNESS:  f32 = 2.5;  // minimum mark size in screen pixels (tune: 1.0 = hairline)
+const DASH_LEN:       i32 = 14;   // white-dash length in screen pixels
+const DASH_GAP:       i32 = 14;   // black-gap length in screen pixels
+// Feather-band guide lines (inner 0.9 / outer 0.1 contours drawn faint + static).
+const GUIDE_THICKNESS: f32 = 1.5;  // screen px for guide-line squares
+const GUIDE_GREY:      u8  = 160;  // guide-line luminance (0=black, 255=white)
+const GUIDE_ALPHA:     u8  = 140;  // guide-line opacity  (255=opaque)
+// Coverage feedback
+const HIGH_COVERAGE_WARN_PCT: f64 = 85.0;  // % above which a pick is rejected
+const DEFAULT_AGGR:           f32 = 25.0;  // default Aggressiveness slider value
+const DEFAULT_FEATHER:        f32 = 15.0;  // default Feather slider value
+// Power-curve exponents that back-load the Aggr/Feather sliders.
+// pct_effective = (pct/100)^GAMMA * 100, so low/mid values stay precise
+// and the broad range is pushed toward the top of the slider travel.
+// Both default to 3.0; use separate consts for independent tuning later.
+const AGGR_GAMMA:    f32 = 3.0;
+const FEATHER_GAMMA: f32 = 3.0;
 
 // Payload type for the background render channel.
 // Plasma sends linear-light f32 directly; qbist sends sRGB u8 for conversion.
@@ -84,6 +105,31 @@ fn layer_to_color_image(layer: &Layer) -> egui::ColorImage {
         ));
     }
     egui::ColorImage { size: [w, h], pixels }
+}
+
+/// Extract boundary pixels (0.5 contour) from a selection mask.
+/// A pixel is on the boundary if it differs (>= 0.5 vs < 0.5) from any 4-neighbor.
+/// Stored in image coords as (col, row) for fast projection to screen space.
+/// Only recomputed when the mask changes — cached between frames.
+/// Pixels that sit on the threshold crossing at `thresh` (4-neighbour test).
+/// Returns image-space (col, row) pairs for all boundary pixels.
+fn compute_selection_boundary(mask: &[f32], w: usize, h: usize, thresh: f32) -> Vec<(u16, u16)> {
+    let mut out = Vec::new();
+    for row in 0..h {
+        for col in 0..w {
+            let i   = row * w + col;
+            let sel = mask[i] >= thresh;
+            let on_edge =
+                (row > 0     && (mask[(row - 1) * w + col    ] >= thresh) != sel) ||
+                (row + 1 < h && (mask[(row + 1) * w + col    ] >= thresh) != sel) ||
+                (col > 0     && (mask[ row      * w + col - 1] >= thresh) != sel) ||
+                (col + 1 < w && (mask[ row      * w + col + 1] >= thresh) != sel);
+            if on_edge {
+                out.push((col as u16, row as u16));
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -213,6 +259,18 @@ struct BasecoatApp {
     kaleido_rotation: f32,
     kaleido_zoom:     f32,
 
+    // Select by Color  (selection_mask + has_selection live in self.stack)
+    selection_aggr:         f32,
+    selection_feather:      f32,
+    selection_pick_mode:    bool,
+    selection_coverage_pct: f64,
+    // Three cached contours (image coords) for the feather-band visualisation.
+    // All recomputed together only when the mask changes; never touched during draw.
+    selection_boundary:       Vec<(u16, u16)>,  // main  — mask >= 0.5 (marching ants)
+    selection_boundary_inner: Vec<(u16, u16)>,  // inner — mask >= 0.9 (faint guide)
+    selection_boundary_outer: Vec<(u16, u16)>,  // outer — mask >= 0.1 (faint guide)
+    selection_boundary_dirty: bool,
+
     // Zoom / pan
     zoom:     f32,
     fit_zoom: f32,
@@ -224,6 +282,10 @@ struct BasecoatApp {
 impl BasecoatApp {
     fn new() -> Self {
         let mut stack = Stack::new();
+        // Initialise selection state BEFORE the first stack.add() so the very
+        // first structural snap already carries a valid (empty) selection.
+        stack.selection_mask = vec![0.0f32; IMG_W * IMG_H];
+        stack.has_selection  = false;
         let base = Layer::new(W, H, [0.0, 0.0, 0.0, 0.0]);
         stack.add(base).unwrap();
 
@@ -267,6 +329,15 @@ impl BasecoatApp {
             kaleido_segments: 6,
             kaleido_rotation: 0.0,
             kaleido_zoom:     1.0,
+
+            selection_aggr:         DEFAULT_AGGR,
+            selection_feather:      DEFAULT_FEATHER,
+            selection_pick_mode:    false,
+            selection_coverage_pct: 0.0,
+            selection_boundary:       Vec::new(),
+            selection_boundary_inner: Vec::new(),
+            selection_boundary_outer: Vec::new(),
+            selection_boundary_dirty: false,
 
             zoom:     0.0,
             fit_zoom: 1.0,
@@ -383,6 +454,17 @@ impl BasecoatApp {
         if n == 0       { self.active = 0; }
         else if self.active >= n { self.active = n - 1; }
     }
+
+    fn clear_selection(&mut self) {
+        self.stack.selection_mask.fill(0.0);
+        self.stack.has_selection          = false;
+        self.selection_coverage_pct       = 0.0;
+        self.selection_boundary.clear();
+        self.selection_boundary_inner.clear();
+        self.selection_boundary_outer.clear();
+        self.selection_boundary_dirty     = false;
+        self.dirty                        = true;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -422,21 +504,59 @@ impl eframe::App for BasecoatApp {
                 let idx    = self.render_target_idx;
                 let status = std::mem::take(&mut self.render_finish);
                 if idx < self.stack.layers.len() {
+                    let lw = self.stack.layers[idx].width  as usize;
+                    let lh = self.stack.layers[idx].height as usize;
+                    let n_px = lw * lh;
+                    // Mask blend only when selection active and dims match.
+                    let use_mask = self.stack.has_selection && self.stack.selection_mask.len() == n_px;
+                    if !use_mask && self.stack.has_selection {
+                        self.status = format!(
+                            "{}: selection size mismatch — applied to whole layer",
+                            self.render_label
+                        );
+                    }
                     match buf {
                         RenderBuf::SrgbU8(pixels) => {
-                            let w     = self.stack.layers[idx].width  as usize;
-                            let h     = self.stack.layers[idx].height as usize;
-                            let layer = &mut self.stack.layers[idx];
-                            for i in 0..w * h {
-                                let s = i * 4;
-                                layer.rgba[s    ] = srgb_to_linear(pixels[s    ] as f32 / 255.0);
-                                layer.rgba[s + 1] = srgb_to_linear(pixels[s + 1] as f32 / 255.0);
-                                layer.rgba[s + 2] = srgb_to_linear(pixels[s + 2] as f32 / 255.0);
-                                layer.rgba[s + 3] = 1.0;
+                            if use_mask {
+                                // Convert to linear, then lerp through mask into the existing layer.
+                                for i in 0..n_px {
+                                    let m = self.stack.selection_mask[i];
+                                    let s = i * 4;
+                                    let nr = srgb_to_linear(pixels[s    ] as f32 / 255.0);
+                                    let ng = srgb_to_linear(pixels[s + 1] as f32 / 255.0);
+                                    let nb = srgb_to_linear(pixels[s + 2] as f32 / 255.0);
+                                    let layer = &mut self.stack.layers[idx];
+                                    layer.rgba[s    ] = layer.rgba[s    ] * (1.0 - m) + nr * m;
+                                    layer.rgba[s + 1] = layer.rgba[s + 1] * (1.0 - m) + ng * m;
+                                    layer.rgba[s + 2] = layer.rgba[s + 2] * (1.0 - m) + nb * m;
+                                    layer.rgba[s + 3] = layer.rgba[s + 3] * (1.0 - m) + m;
+                                }
+                            } else {
+                                let layer = &mut self.stack.layers[idx];
+                                for i in 0..n_px {
+                                    let s = i * 4;
+                                    layer.rgba[s    ] = srgb_to_linear(pixels[s    ] as f32 / 255.0);
+                                    layer.rgba[s + 1] = srgb_to_linear(pixels[s + 1] as f32 / 255.0);
+                                    layer.rgba[s + 2] = srgb_to_linear(pixels[s + 2] as f32 / 255.0);
+                                    layer.rgba[s + 3] = 1.0;
+                                }
                             }
                         }
                         RenderBuf::Linear(pixels) => {
-                            self.stack.layers[idx].rgba = pixels;
+                            if use_mask {
+                                // Save old pixels, then lerp new → old through mask.
+                                let old = self.stack.layers[idx].rgba.clone();
+                                for i in 0..n_px {
+                                    let m = self.stack.selection_mask[i];
+                                    let s = i * 4;
+                                    for c in 0..4usize {
+                                        self.stack.layers[idx].rgba[s + c] =
+                                            old[s + c] * (1.0 - m) + pixels[s + c] * m;
+                                    }
+                                }
+                            } else {
+                                self.stack.layers[idx].rgba = pixels;
+                            }
                         }
                     }
                     self.dirty = true;
@@ -479,13 +599,21 @@ impl eframe::App for BasecoatApp {
                 ui.menu_button("File", |ui| {
                     if ui.button("New").clicked() {
                         self.stack = Stack::new();
+                        self.stack.selection_mask = vec![0.0f32; IMG_W * IMG_H];
+                        self.stack.has_selection  = false;
                         let base = Layer::new(W, H, [0.0, 0.0, 0.0, 0.0]);
                         self.stack.add(base).unwrap();
-                        self.active         = 0;
-                        self.dirty          = true;
-                        self.thumb_textures = vec![None];
-                        self.thumb_dirty    = vec![true];
+                        self.active               = 0;
+                        self.dirty                = true;
+                        self.thumb_textures       = vec![None];
+                        self.thumb_dirty          = vec![true];
                         self.marked.clear();
+                        self.selection_pick_mode      = false;
+                        self.selection_coverage_pct   = 0.0;
+                        self.selection_boundary.clear();
+                        self.selection_boundary_inner.clear();
+                        self.selection_boundary_outer.clear();
+                        self.selection_boundary_dirty = false;
                         self.status = "New canvas".into();
                         ui.close_menu();
                     }
@@ -524,6 +652,15 @@ impl eframe::App for BasecoatApp {
                             self.dirty = true;
                             self.thumb_invalidate_all();
                             self.marked.clear();
+                            // Recompute derived selection fields from the restored mask.
+                            // stack.selection_mask + stack.has_selection were rolled back
+                            // atomically with the pixels inside stack.undo().
+                            self.selection_coverage_pct = if self.stack.has_selection {
+                                mask_coverage_pct(&self.stack.selection_mask)
+                            } else {
+                                0.0
+                            };
+                            self.selection_boundary_dirty = self.stack.has_selection;
                             self.status = "Undo".into();
                         } else {
                             self.status = "Nothing to undo".into();
@@ -569,19 +706,21 @@ impl eframe::App for BasecoatApp {
                 self.show_layers_panel(ui);
             });
 
+        let ant_time = ctx.input(|i| i.time);
         egui::CentralPanel::default().show(ctx, |ui| {
-            self.show_canvas(ui);
+            self.show_canvas(ui, ant_time);
         });
 
-        // Keep painting while any background render is in flight so the progress bar animates.
-        if self.render_rx.is_some() {
+        // Keep painting while a render is in flight (progress bar) or a selection is
+        // active (ants animation). No repaint when truly idle.
+        if self.render_rx.is_some() || self.stack.has_selection {
             ctx.request_repaint();
         }
     }
 }
 
 impl BasecoatApp {
-    fn show_canvas(&mut self, ui: &mut egui::Ui) {
+    fn show_canvas(&mut self, ui: &mut egui::Ui, ant_time: f64) {
         let Some(tex) = &self.texture else { return; };
         let avail    = ui.available_size();
         let img_size = egui::vec2(W as f32, H as f32);
@@ -596,17 +735,172 @@ impl BasecoatApp {
         });
         self.pan += drag;
 
+        // Recompute the boundary pixel cache when the mask has changed.
+        // This is a one-shot scan (not per-frame) — only triggered by Pick or Clear.
+        if self.selection_boundary_dirty && self.stack.has_selection {
+            let mask = &self.stack.selection_mask;
+            self.selection_boundary       = compute_selection_boundary(mask, IMG_W, IMG_H, 0.5);
+            self.selection_boundary_inner = compute_selection_boundary(mask, IMG_W, IMG_H, 0.9);
+            self.selection_boundary_outer = compute_selection_boundary(mask, IMG_W, IMG_H, 0.1);
+            self.selection_boundary_dirty = false;
+        }
+
+        let pick_mode = self.selection_pick_mode;
+        let has_sel   = self.stack.has_selection;
+        // Dash phase: advances at 6 image-pixels/second so the ants crawl noticeably.
+        let ant_phase = (ant_time * 6.0) as i32;
+
+        // Collect pick result here to avoid borrow conflict when mutating self later.
+        let mut pick_result: Option<(Vec<f32>, usize, usize)> = None;
+
         egui::ScrollArea::both().id_salt("canvas_scroll").show(ui, |ui| {
             let offset_rect = egui::Rect::from_min_size(ui.cursor().min + self.pan, display_size);
-            let resp = ui.allocate_rect(offset_rect, egui::Sense::drag());
-            if resp.dragged_by(egui::PointerButton::Primary) { self.pan += resp.drag_delta(); }
+            let sense = if pick_mode {
+                egui::Sense::click_and_drag()
+            } else {
+                egui::Sense::drag()
+            };
+            let resp = ui.allocate_rect(offset_rect, sense);
+            // Pan on primary drag only when not in pick mode
+            if !pick_mode && resp.dragged_by(egui::PointerButton::Primary) {
+                self.pan += resp.drag_delta();
+            }
             ui.painter().image(
                 tex.id(),
                 offset_rect,
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 egui::Color32::WHITE,
             );
+
+            // Three-contour feather-band display — drawn over the canvas, display-only.
+            // Projects image-space pixels to screen, deduplicates per contour, then draws:
+            //   outer (mask>=0.1): faint static grey — leading edge of feather zone
+            //   main  (mask>=0.5): crisp animated black/white ants — reference boundary
+            //   inner (mask>=0.9): faint static grey — fully-selected edge
+            // When Feather=0 all three coincide; as Feather grows the band widens.
+            if has_sel {
+                let painter = ui.painter();
+
+                // Closure: project a boundary list to deduplicated screen points.
+                // Captures offset_rect + effective_zoom by copy (both Copy types).
+                let project = |boundary: &[(u16, u16)]| -> Vec<egui::Pos2> {
+                    let mut seen: HashSet<(i32, i32)> = HashSet::new();
+                    let mut pts  = Vec::new();
+                    for &(bx, by) in boundary {
+                        let sx  = offset_rect.min.x + bx as f32 * effective_zoom;
+                        let sy  = offset_rect.min.y + by as f32 * effective_zoom;
+                        let key = (sx as i32, sy as i32);
+                        if seen.insert(key) {
+                            pts.push(egui::pos2(sx, sy));
+                        }
+                    }
+                    pts
+                };
+
+                let guide_color = egui::Color32::from_rgba_unmultiplied(
+                    GUIDE_GREY, GUIDE_GREY, GUIDE_GREY, GUIDE_ALPHA,
+                );
+                let guide_sz = effective_zoom.max(GUIDE_THICKNESS);
+
+                // Outer guide (mask >= 0.1): static faint grey.
+                if !self.selection_boundary_outer.is_empty() {
+                    for pt in project(&self.selection_boundary_outer) {
+                        painter.rect_filled(
+                            egui::Rect::from_min_size(pt, egui::vec2(guide_sz, guide_sz)),
+                            0.0,
+                            guide_color,
+                        );
+                    }
+                }
+
+                // Inner guide (mask >= 0.9): static faint grey.
+                if !self.selection_boundary_inner.is_empty() {
+                    for pt in project(&self.selection_boundary_inner) {
+                        painter.rect_filled(
+                            egui::Rect::from_min_size(pt, egui::vec2(guide_sz, guide_sz)),
+                            0.0,
+                            guide_color,
+                        );
+                    }
+                }
+
+                // Main ants (mask >= 0.5): animated black/white dashes (unchanged).
+                if !self.selection_boundary.is_empty() {
+                    let screen_pts = project(&self.selection_boundary);
+                    let px_sz  = effective_zoom.max(ANT_THICKNESS);
+                    let period = DASH_LEN + DASH_GAP;
+                    for (i, pt) in screen_pts.iter().enumerate() {
+                        let slot  = (i as i32 + ant_phase).rem_euclid(period);
+                        let color = if slot < DASH_LEN { egui::Color32::WHITE } else { egui::Color32::BLACK };
+                        painter.rect_filled(
+                            egui::Rect::from_min_size(*pt, egui::vec2(px_sz, px_sz)),
+                            0.0,
+                            color,
+                        );
+                    }
+                }
+            }
+
+            // Pick-mode click: sample color from active layer
+            if pick_mode && resp.clicked() {
+                if let Some(click_pos) = resp.interact_pointer_pos() {
+                    let rel = click_pos - offset_rect.min;
+                    let px = (rel.x / effective_zoom).clamp(0.0, W as f32 - 1.0) as usize;
+                    let py = (rel.y / effective_zoom).clamp(0.0, H as f32 - 1.0) as usize;
+                    // Apply back-loaded power curve so low slider values stay precise.
+                    // select_by_color does (pct/100)*MAX_DIST internally; passing the
+                    // curved pct gives tol = (raw/100)^GAMMA * MAX_DIST with no change
+                    // to selection.rs.
+                    let aggr    = (self.selection_aggr    / 100.0).powf(AGGR_GAMMA)    * 100.0;
+                    let feather = (self.selection_feather / 100.0).powf(FEATHER_GAMMA) * 100.0;
+                    let active  = self.active;
+                    if let Some(layer) = self.stack.layers.get(active) {
+                        let src = (py * W as usize + px) * 4;
+                        if src + 2 < layer.rgba.len() {
+                            let pr = layer.rgba[src    ];
+                            let pg = layer.rgba[src + 1];
+                            let pb = layer.rgba[src + 2];
+                            let pick = select_by_color(
+                                &layer.rgba, W as usize, H as usize,
+                                pr, pg, pb, aggr, feather,
+                            );
+                            pick_result = Some((pick, px, py));
+                        }
+                    }
+                }
+            }
         });
+
+        // Apply the pick (outside ScrollArea / immutable borrow scope).
+        // Rejection gate: evaluate the INDIVIDUAL pick's coverage before touching
+        // any state. This keeps additive large-but-intentional selections working —
+        // only a single over-broad pick is blocked, never the accumulated total.
+        if let Some((pick, _px, _py)) = pick_result {
+            let pick_cov = mask_coverage_pct(&pick);
+            if pick_cov >= HIGH_COVERAGE_WARN_PCT {
+                // Reject: wipe any existing selection and reset sliders — full fresh start.
+                self.clear_selection();
+                self.selection_aggr    = DEFAULT_AGGR;
+                self.selection_feather = DEFAULT_FEATHER;
+                self.status = format!(
+                    "Pick rejected: would select {:.1}% — selection and sliders reset, pick again.",
+                    pick_cov,
+                );
+            } else {
+                if self.stack.has_selection {
+                    // Additive: grow the existing selection.
+                    union_masks(&mut self.stack.selection_mask, &pick);
+                } else {
+                    // No active selection — start fresh so stale mask bytes can't accumulate.
+                    self.stack.selection_mask = pick;
+                }
+                self.stack.has_selection      = true;
+                self.dirty                    = true;
+                self.selection_boundary_dirty = true;
+                self.selection_coverage_pct   = mask_coverage_pct(&self.stack.selection_mask);
+                self.status = format!("Selection: {:.1}%", self.selection_coverage_pct);
+            }
+        }
     }
 
     // ---- Band generator ---------------------------------------------------
@@ -1123,6 +1417,89 @@ impl BasecoatApp {
             });
         }
 
+        // ---- Select by Color ----
+        ui.separator();
+        ui.heading("Select by Color");
+        ui.horizontal(|ui| {
+            ui.label("Aggr %:");
+            ui.add(egui::Slider::new(&mut self.selection_aggr, 0.0_f32..=100.0).fixed_decimals(0));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Feather %:");
+            ui.add(egui::Slider::new(&mut self.selection_feather, 0.0_f32..=100.0).fixed_decimals(0));
+        });
+        {
+            // sqrt(3) ≈ 1.732 is the max Euclidean distance in the unit RGB cube.
+            // Apply the same power curve used at pick time so the label matches reality.
+            let max_d = 3.0_f32.sqrt();
+            let tol = (self.selection_aggr   / 100.0).powf(AGGR_GAMMA)    * max_d;
+            let fth = (self.selection_feather / 100.0).powf(FEATHER_GAMMA) * max_d;
+            ui.label(
+                egui::RichText::new(format!(
+                    "tol {:.2} / feather {:.2}  (max {:.2})", tol, fth, max_d,
+                ))
+                .small()
+                .weak(),
+            );
+        }
+        ui.horizontal(|ui| {
+            let pick_lbl = if self.selection_pick_mode { "◉ Pick (click canvas)" } else { "Pick" };
+            if ui.selectable_label(self.selection_pick_mode, pick_lbl).clicked() {
+                self.selection_pick_mode ^= true;
+            }
+            if ui.button("Clear Selection").clicked() {
+                self.clear_selection();
+                self.selection_pick_mode = false;
+                self.status              = "Selection cleared".into();
+            }
+        });
+        if self.stack.has_selection {
+            ui.label(format!("Selected: {:.1}%", self.selection_coverage_pct));
+        }
+
+        // ---- Adjustments ----
+        // Template: each adjustment calls adjust::apply_adjustment through the mask.
+        // To add a new one: write a sibling fn in adjust.rs + a button here.
+        ui.separator();
+        ui.heading("Adjustments");
+        if ui.button("Invert")
+            .on_hover_text("Perceptual (sRGB) invert — whole layer or clipped to selection")
+            .clicked()
+        {
+            if self.stack.layers.is_empty() {
+                self.status = "Invert: no active layer".into();
+            } else {
+                let idx  = self.active;
+                let name = self.active_name();
+                let lw   = self.stack.layers[idx].width  as usize;
+                let lh   = self.stack.layers[idx].height as usize;
+                let n_px = lw * lh;
+
+                let mask_matches = self.stack.has_selection && self.stack.selection_mask.len() == n_px;
+                // Clone the mask before the mutable borrow in snapshot_layer; the
+                // immutable borrow of self.stack.selection_mask must not outlive it.
+                let mask_clone: Option<Vec<f32>> = if mask_matches {
+                    Some(self.stack.selection_mask.clone())
+                } else {
+                    None
+                };
+
+                self.stack.snapshot_layer(idx);
+                adjust_invert(&mut self.stack.layers[idx].rgba, mask_clone.as_deref());
+                self.dirty = true;
+                self.thumb_invalidate(idx);
+
+                self.status = if mask_matches {
+                    format!("Inverted selection on {name}")
+                } else if self.stack.has_selection {
+                    // mask existed but dims didn't match — fell back to whole layer
+                    format!("Inverted {name} (selection size mismatch — whole layer)")
+                } else {
+                    format!("Inverted {name}")
+                };
+            }
+        }
+
         // ---- Plasma ----
         ui.separator();
         ui.heading("Plasma");
@@ -1267,10 +1644,33 @@ impl BasecoatApp {
             if ui.add(egui::Slider::new(&mut p, 1..=6)).changed() { self.punch_passes = p as u32; }
         });
         if ui.button("Apply Punch").clicked() {
-            let k = self.punch_contrast; let sat = self.punch_saturation; let pass = self.punch_passes;
-            let idx = self.active;
+            let k    = self.punch_contrast;
+            let sat  = self.punch_saturation;
+            let pass = self.punch_passes;
+            let idx  = self.active;
+            let lw   = self.stack.layers[idx].width  as usize;
+            let lh   = self.stack.layers[idx].height as usize;
+            let n_px = lw * lh;
+            let use_mask = self.stack.has_selection && self.stack.selection_mask.len() == n_px;
             self.stack.snapshot_layer(idx);
+            // Clone pre-punch pixels for masked blend (only when selection is active).
+            let pre_punch = if use_mask {
+                Some(self.stack.layers[idx].rgba.clone())
+            } else {
+                None
+            };
             punch(&mut self.stack.layers[idx].rgba, k, sat, pass);
+            if let Some(old) = pre_punch {
+                for i in 0..n_px {
+                    let m = self.stack.selection_mask[i];
+                    let s = i * 4;
+                    for c in 0..4usize {
+                        let punched = self.stack.layers[idx].rgba[s + c];
+                        self.stack.layers[idx].rgba[s + c] =
+                            old[s + c] * (1.0 - m) + punched * m;
+                    }
+                }
+            }
             self.dirty = true;
             self.thumb_invalidate(idx);
             let name = self.active_name();

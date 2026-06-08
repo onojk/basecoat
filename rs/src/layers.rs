@@ -167,9 +167,16 @@ pub fn composite(layers: &[Layer]) -> Layer {
 // Undo snapshots
 // ---------------------------------------------------------------------------
 
+/// Selection state bundled into every undo snapshot so pixels and selection
+/// always roll back together — never independently.
+struct SelSnap {
+    mask:          Vec<f32>,
+    has_selection: bool,
+}
+
 enum Snap {
-    Pixel  { idx: usize, buf: Vec<f32> },
-    Struct { layers: Vec<Layer> },
+    Pixel  { idx: usize, buf: Vec<f32>,    sel: SelSnap },
+    Struct { layers: Vec<Layer>,           sel: SelSnap },
 }
 
 // ---------------------------------------------------------------------------
@@ -177,7 +184,12 @@ enum Snap {
 // ---------------------------------------------------------------------------
 
 pub struct Stack {
-    pub layers: Vec<Layer>,
+    pub layers:        Vec<Layer>,
+    /// Active selection mask (W×H, linear 0–1). Always kept in sync with
+    /// `has_selection`; when `has_selection` is false, content is undefined
+    /// and must not be used for pixel operations.
+    pub selection_mask: Vec<f32>,
+    pub has_selection:  bool,
     undo: Vec<Snap>,
 }
 
@@ -187,31 +199,45 @@ impl Default for Stack {
 
 impl Stack {
     pub fn new() -> Self {
-        Self { layers: Vec::new(), undo: Vec::new() }
+        Self {
+            layers:         Vec::new(),
+            selection_mask: Vec::new(), // GUI sets to W×H zeros before first use
+            has_selection:  false,
+            undo:           Vec::new(),
+        }
     }
 
     /// Snapshot one layer's pixel buffer for undo without modifying it.
-    /// Use before any destructive pixel op (punch, custom fill, etc.).
+    /// Selection state is captured alongside pixels — they always restore together.
     pub fn snapshot_layer(&mut self, idx: usize) {
         self.push_pixel_snap(idx);
     }
 
-    /// Take a full structural snapshot (whole layer list). Use once before a
-    /// multi-step operation so the entire run is undone in a single Undo.
+    /// Take a full structural snapshot (whole layer list).
+    /// Selection state is captured alongside structure.
     pub fn checkpoint(&mut self) {
         self.push_struct_snap();
     }
 
+    fn sel_snap(&self) -> SelSnap {
+        SelSnap {
+            mask:          self.selection_mask.clone(),
+            has_selection: self.has_selection,
+        }
+    }
+
     fn push_pixel_snap(&mut self, idx: usize) {
         let buf = self.layers[idx].rgba.clone();
-        self.undo.push(Snap::Pixel { idx, buf });
+        let sel = self.sel_snap();
+        self.undo.push(Snap::Pixel { idx, buf, sel });
         if self.undo.len() > UNDO_DEPTH {
             self.undo.remove(0);
         }
     }
 
     fn push_struct_snap(&mut self) {
-        self.undo.push(Snap::Struct { layers: self.layers.clone() });
+        let sel = self.sel_snap();
+        self.undo.push(Snap::Struct { layers: self.layers.clone(), sel });
         if self.undo.len() > UNDO_DEPTH {
             self.undo.remove(0);
         }
@@ -266,12 +292,16 @@ impl Stack {
     pub fn undo(&mut self) -> bool {
         match self.undo.pop() {
             None => false,
-            Some(Snap::Pixel { idx, buf }) => {
+            Some(Snap::Pixel { idx, buf, sel }) => {
                 self.layers[idx].rgba = buf;
+                self.selection_mask   = sel.mask;
+                self.has_selection    = sel.has_selection;
                 true
             }
-            Some(Snap::Struct { layers }) => {
-                self.layers = layers;
+            Some(Snap::Struct { layers, sel }) => {
+                self.layers           = layers;
+                self.selection_mask   = sel.mask;
+                self.has_selection    = sel.has_selection;
                 true
             }
         }
